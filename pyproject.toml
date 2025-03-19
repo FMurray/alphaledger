@@ -1,0 +1,27 @@
+[project]
+name = "alphaledger"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Forrest Murray", email = "forrest.murray@databricks.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.13.3",
+    "pandas>=2.2.3",
+    "pydantic>=2.10.6",
+    "pydantic-settings>=2.8.1",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.3",
+    "rich>=13.9.4",
+    "yfinance>=0.2.54",
+]
+
+[project.scripts]
+alphaledger = "alphaledger:main"
+build-kb = "alphaledger:build_kb"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
