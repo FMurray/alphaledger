@@ -69,3 +69,29 @@ Build Knowledge Base Options:
 | Option | Short | Default | Description |
 |--------|-------|---------|-------------|
 | `--depth` | `-d` | 1 | Depth of information to collect for knowledge base |
+| `--embedding-model` | | text-embedding-3-small | OpenAI/other model to use for embeddings |
+
+
+
+#### Build Knowledge Base
+
+```python
+from alphaledger.kb import KnowledgeBase
+# Create a local knowledge base (for testing)
+local_kb = KnowledgeBase(uri="local://kb_data")
+# Create a remote knowledge base (for production)
+remote_kb = KnowledgeBase(uri="s3://your-bucket/kb_data")
+# Add documents to the knowledge base
+local_kb.add_documents([
+{"ticker": "MSFT", "text": "Microsoft's cloud revenue grew by 22% in Q2 2023", "date": "2023-07-15"},
+{"ticker": "AMZN", "text": "Amazon Web Services reports slower growth amid cloud spending cuts", "date": "2023-08-03"}
+])
+# Search the knowledge base
+results = local_kb.search("cloud revenue growth", limit=5)
+for doc in results:
+    print(f"{doc.ticker}: {doc.text} ({doc.date}) - Relevance: {doc.score}")
+```
+
+
+
+

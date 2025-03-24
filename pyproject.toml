@@ -9,12 +9,14 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "beautifulsoup4>=4.13.3",
+    "openai>=1.68.2",
     "pandas>=2.2.3",
     "pydantic>=2.10.6",
     "pydantic-settings>=2.8.1",
     "pyyaml>=6.0.2",
     "requests>=2.32.3",
     "rich>=13.9.4",
+    "torch>=2.6.0",
     "yfinance>=0.2.54",
 ]
 
@@ -25,3 +27,8 @@ build-kb = "alphaledger:build_kb"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "lancedb>=0.21.1",
+]

@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict, CliImplicitFlag
 from pathlib import Path
 from pydantic import Field, field_validator, AliasChoices
-from typing import Optional
+from typing import Optional, Literal
 import os
 
 from rich import print
@@ -37,6 +37,12 @@ class AlphaLedgerSettings(BaseSettings):
     databricks_host: Optional[str] = None
     databricks_token: Optional[str] = None
 
+    # Azure OpenAI settings
+    azure_openai_api_key: Optional[str] = None
+    azure_openai_api_base: Optional[str] = None
+    azure_openai_api_version: Optional[str] = None
+    azure_openai_embeding_deployment_id: Optional[str] = None
+    azure_openai_embeding_endpoint: Optional[str] = None
     # SEC API settings
     sec_user_agent: str = Field(
         default="AlphaLedger (contact@alphaledger.com)",
@@ -73,6 +79,38 @@ class AlphaLedgerSettings(BaseSettings):
         description="Enable verbose output",
         validation_alias=AliasChoices("verbose", "v"),
     )
+    kb_uri: str = Field(
+        default="",  # Temporary placeholder, will be set in validator
+        description="URI for the knowledge base",
+    )
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        description="Embedding model to use for the knowledge base",
+    )
+    kb_index_type: str = Field(
+        default="IVF_PQ",
+        description="Type of index to use for the knowledge base",
+    )
+    kb_index_metric: Literal["l2", "cosine", "dot"] = Field(
+        default="l2",
+        description="Metric to use for the knowledge base index",
+    )
+    kb_index_num_partitions: int = Field(
+        default=256,
+        description="Number of partitions for the IVF_PQ index",
+    )
+    kb_index_num_sub_vectors: int = Field(
+        default=96,  # This will be overridden by dimension/16 if not specified
+        description="Number of sub-vectors for the IVF_PQ index",
+    )
+    kb_index_num_bits: int = Field(
+        default=8,
+        description="Number of bits for encoding each sub-vector (4 or 8)",
+    )
+    kb_accelerator: Optional[Literal["cuda", "mps"]] = Field(
+        default=None,
+        description="GPU acceleration for index building ('cuda' for NVIDIA GPUs, 'mps' for Apple Silicon)",
+    )
 
     @field_validator("universe_dir", "output_dir", mode="before")
     def convert_to_path(cls, v):
@@ -108,6 +146,33 @@ class AlphaLedgerSettings(BaseSettings):
 
         # Default to project structure if not specified
         return Path(__file__).parent.parent.parent / "output"
+
+    @field_validator("kb_index_num_bits")
+    def validate_num_bits(cls, v):
+        """Validate num_bits is either 4 or 8"""
+        if v not in [4, 8]:
+            raise ValueError("num_bits must be either 4 or 8")
+        return v
+
+    @field_validator("kb_accelerator")
+    def validate_accelerator(cls, v):
+        """Validate accelerator is None, 'cuda', or 'mps'"""
+        if v is not None and v not in ["cuda", "mps"]:
+            raise ValueError("accelerator must be 'cuda', 'mps', or None")
+        return v
+
+    @field_validator("kb_uri", mode="after")
+    def set_kb_uri(cls, v, info):
+        """Set kb_uri based on output_dir if not explicitly provided"""
+        if v:  # If kb_uri is explicitly set, use it
+            return v
+
+        # Get the output_dir from the data
+        output_dir = info.data.get("output_dir")
+        if output_dir:
+            # Create a local URI using the output_dir
+            return f"{output_dir}/kb_data"
+        return "output/kb_data"  # Fallback default
 
 
 console = Console()
