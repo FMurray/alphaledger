@@ -415,14 +415,27 @@ def process_filing_contents(
                     logger.info(f"Skipping already downloaded filing: {filepath}")
                 continue
 
-            # Extract accession number from URL
-            documents_url = filing.get("documents_url", "")
-            if "/accession_number=" in documents_url:
-                accession_number = documents_url.split("accession_number=")[1].split(
-                    "&"
-                )[0]
+            # Get the accession number directly from the metadata
+            accession_number = filing.get("accession_number", "")
 
-                # Get the full filing text using CIK stored in the filing metadata
+            # If accession number isn't directly available, try to extract it from URL
+            if not accession_number:
+                documents_url = filing.get("documents_url", "")
+                # The URL format is typically: .../data/0001018724/000101872424000008/0001018724-24-000008-index.html
+                # Extract the accession number from the path segment
+                if "/Archives/edgar/data/" in documents_url:
+                    try:
+                        # Extract from path - take the second-to-last segment before the filename
+                        path_parts = documents_url.split("/")
+                        accession_number = path_parts[-2]
+                    except Exception as e:
+                        if verbose and logger:
+                            logger.warning(
+                                f"Failed to extract accession number from URL: {documents_url}, error: {e}"
+                            )
+
+            # Get the full filing text using CIK stored in the filing metadata
+            if accession_number:
                 if verbose and logger:
                     logger.info(
                         f"Fetching filing: {ticker} - {year} (Accession: {accession_number})"
@@ -441,16 +454,27 @@ def process_filing_contents(
 
                         # Extract and save just the text content
                         text_content = sec_fetcher.extract_text_from_filing(filing_text)
-                        text_filepath = filepath.replace(".txt", "_text.txt")
+                        # Use the Path object's proper method for manipulating paths
+                        text_filepath = filepath.with_name(filepath.stem + "_text.txt")
                         with open(text_filepath, "w", encoding="utf-8") as f:
                             f.write(text_content)
 
                         processed_count += 1
+                    else:
+                        if verbose and logger:
+                            logger.warning(
+                                f"Failed to fetch filing content for {ticker} - {year} (Accession: {accession_number})"
+                            )
                 else:
                     if verbose and logger:
                         logger.warning(
                             f"No CIK information found for filing {ticker} - {year}"
                         )
+            else:
+                if verbose and logger:
+                    logger.warning(
+                        f"No accession number found for filing {ticker} - {year}"
+                    )
 
     return processed_count
 
@@ -483,82 +507,88 @@ def fetch_and_process_filing(
     Returns:
         List of text chunks with metadata
     """
-    # This function processes filings that were already downloaded by process_filing_contents
+    from .process_xbrl import (
+        ProcessingOptions,
+        process_filing_content,
+        generate_placeholder_data,
+    )
+
+    # Convert depth to processing options
+    options = ProcessingOptions.NONE
+    if depth == 1:
+        options = ProcessingOptions.LEVEL_1
+    elif depth == 2:
+        options = ProcessingOptions.LEVEL_2
+    else:  # depth 3 or higher
+        options = ProcessingOptions.LEVEL_3
+
+    # Log the options if verbose
+    if verbose and logger:
+        logger.info(f"Processing {ticker} {filing_type} with options: {options}")
+
+    # This function processes filings that were already downloaded
     filings_dir = output_dir / "filings" / ticker
 
     # Try to find the filing based on the year from filing_date
     year = filing_date.split("-")[0]
     text_file_path = filings_dir / f"{ticker}_10K_{year}_text.txt"
+    raw_file_path = filings_dir / f"{ticker}_10K_{year}.txt"
 
     chunks = []
 
     # If we have the processed text file, use it
-    if os.path.exists(text_file_path):
+    if os.path.exists(text_file_path) and os.path.exists(raw_file_path):
         if verbose and logger:
             logger.info(f"Using existing processed filing: {text_file_path}")
 
-        # Read the file and divide into chunks
+        # Read the file for text-based processing
         try:
             with open(text_file_path, "r", encoding="utf-8") as f:
                 full_text = f.read()
 
-            # Split into sections - this is simplified and should be enhanced
-            # with a proper text splitter that respects boundaries like headings
+            # Also load the raw filing for XBRL extraction if needed
+            with open(raw_file_path, "r", encoding="utf-8") as f:
+                raw_filing = f.read()
 
-            # Basic chunking by paragraphs
-            paragraphs = [p for p in full_text.split("\n\n") if p.strip()]
+            # Check if we need to extract XBRL data and if the raw filing contains XBRL
+            has_xbrl = (
+                "<xbrl" in raw_filing.lower() or "xmlns:xbrl" in raw_filing.lower()
+            )
 
-            # For depth 1, we just take a summary
-            if depth == 1:
-                # Just take first few paragraphs as a summary
-                summary_text = (
-                    "\n".join(paragraphs[:5]) if paragraphs else "No text available"
-                )
-                chunks.append({"text": summary_text, "section": "summary"})
-            else:
-                # For higher depths, process more of the document
-                # with more sophisticated chunking
+            if (
+                ProcessingOptions.PRIMARY_FINANCIALS in options
+                or ProcessingOptions.DETAILED_FINANCIALS in options
+            ) and not has_xbrl:
+                # If XBRL processing is requested but the filing doesn't seem to have XBRL data,
+                # try to find the XBRL URL from the documents_url
+                if documents_url and "/Archives/edgar/data/" in documents_url:
+                    # The original URL typically points to an index page
+                    # Try to construct a URL to the XBRL instance document
+                    base_url = documents_url.split("/index.html")[0]
+                    possible_xbrl_urls = [
+                        f"{base_url}/{ticker.lower()}-{year}0101.xml",  # Common format
+                        f"{base_url}/{ticker.lower()}-{year}1231.xml",  # Year-end format
+                        f"{base_url}/{ticker.lower()}.xml",  # Simple format
+                        f"{base_url}/Financial_Report.xml",  # Generic format
+                    ]
 
-                # Set a target chunk size (characters)
-                target_chunk_size = 1000
+                    if verbose and logger:
+                        logger.info(
+                            f"Filing doesn't contain embedded XBRL. Will try direct XBRL URLs."
+                        )
 
-                current_chunk = ""
-                current_section = "unknown"
+                    # Use the URL directly in our extraction function instead of the raw filing
+                    for xbrl_url in possible_xbrl_urls:
+                        if verbose and logger:
+                            logger.info(f"Trying XBRL URL: {xbrl_url}")
+                        raw_filing = xbrl_url  # Pass the URL instead of content
+                        break  # Just try the first URL for now
 
-                # Very basic section detection
-                for paragraph in paragraphs:
-                    # Detect section changes based on all-caps headings or other patterns
-                    if paragraph.isupper() and len(paragraph) < 100:
-                        # If we have content in the current chunk, save it
-                        if current_chunk:
-                            chunks.append(
-                                {
-                                    "text": current_chunk.strip(),
-                                    "section": current_section,
-                                }
-                            )
+            # Process the filing content with the specified options
+            chunks = process_filing_content(
+                ticker, filing_type, filing_date, full_text, raw_filing, options, logger
+            )
 
-                        # Start a new section
-                        current_section = paragraph.strip().lower().replace(" ", "_")
-                        current_chunk = paragraph + "\n"
-                    else:
-                        current_chunk += paragraph + "\n"
-
-                        # If the chunk is getting big, save it and start a new one
-                        if len(current_chunk) > target_chunk_size:
-                            chunks.append(
-                                {
-                                    "text": current_chunk.strip(),
-                                    "section": current_section,
-                                }
-                            )
-                            current_chunk = ""
-
-                # Don't forget the last chunk
-                if current_chunk:
-                    chunks.append(
-                        {"text": current_chunk.strip(), "section": current_section}
-                    )
         except Exception as e:
             if verbose and logger:
                 logger.error(f"Error processing {text_file_path}: {e}")
@@ -568,6 +598,7 @@ def fetch_and_process_filing(
                 {
                     "text": f"Error processing {ticker} {filing_type} from {filing_date}.",
                     "section": "error",
+                    "section_name": "Processing Error",
                 }
             )
     else:
@@ -577,63 +608,21 @@ def fetch_and_process_filing(
                 f"No processed file found for {ticker} {filing_type} {year}, using placeholder data"
             )
 
-        # Simulate different depths of processing with placeholder data
-        if depth >= 1:
-            # Basic information
-            chunks.append(
-                {
-                    "text": f"{ticker} {filing_type} filed on {filing_date}. This filing covers the financial position and business operations.",
-                    "section": "overview",
-                }
-            )
-
-        if depth >= 2:
-            # Add more detailed sections
-            sections = [
-                (
-                    "Business Description",
-                    f"Description of {ticker}'s business operations and markets.",
-                ),
-                (
-                    "Risk Factors",
-                    f"Key risks facing {ticker} as disclosed in the {filing_type}.",
-                ),
-                (
-                    "Management Discussion",
-                    f"Management's discussion and analysis of {ticker}'s financial condition and results of operations.",
-                ),
-                (
-                    "Financial Statements",
-                    f"Summary of {ticker}'s financial statements for the period ending near {filing_date}.",
-                ),
-            ]
-
-            for section_name, section_text in sections:
-                chunks.append(
-                    {
-                        "text": section_text,
-                        "section": section_name.lower().replace(" ", "_"),
-                    }
-                )
-
-        if depth >= 3:
-            # Add even more detailed information
-            chunks.append(
-                {
-                    "text": f"Detailed financial analysis for {ticker} including revenue breakdown, expense analysis, and segment performance.",
-                    "section": "detailed_financials",
-                }
-            )
+        # Generate placeholder data based on options
+        chunks = generate_placeholder_data(ticker, filing_type, filing_date, options)
 
     return chunks
 
 
-def build_kb(logger: Optional[logging.Logger] = None) -> KnowledgeBase:
+def build_kb(
+    logger: Optional[logging.Logger] = None, filings_file: Optional[str] = None
+) -> KnowledgeBase:
     """
     Build the knowledge base from a specified universe.
 
     Args:
         logger: Logger instance
+        filings_file: Path to the parquet file containing filings data
 
     Returns:
         The populated knowledge base
@@ -684,166 +673,179 @@ def build_kb(logger: Optional[logging.Logger] = None) -> KnowledgeBase:
         )
         progress.update(kb_task, advance=1)
 
-        # Load ticker to CIK mapping
-        cik_task = progress.add_task("[cyan]Loading ticker to CIK mappings...", total=1)
-        cache_file = settings.output_dir / "ticker_to_cik.json"
-        ticker_to_cik = load_ticker_to_cik_mapping(
-            universe.get_tickers(), str(cache_file)
-        )
-        progress.update(cik_task, advance=1)
+        # Process filings - load from parquet file if provided
+        filings_task = progress.add_task("[cyan]Processing filings data...", total=1)
 
         # Initialize SEC fetcher
         sec_fetcher = EDGARFetcher(settings.sec_user_agent)
 
-        # Check if we already have filings metadata
-        metadata_path = settings.output_dir / "filings_metadata.json"
-        filings_task = progress.add_task(
-            "[cyan]Processing filings metadata...", total=1
-        )
-
-        if os.path.exists(metadata_path):
+        if filings_file and os.path.exists(filings_file):
+            progress.console.print(f"[yellow]Loading filings data from {filings_file}")
+            filings_df = pd.read_parquet(filings_file)
             progress.console.print(
-                f"[yellow]Loading existing filings metadata from {metadata_path}"
+                f"[green]Loaded {len(filings_df)} filings for {filings_df['ticker'].nunique()} companies"
             )
-            with open(metadata_path, "r") as f:
-                filings = json.load(f)
         else:
-            # Fetch SEC filings metadata
-            progress.console.print("[yellow]Fetching SEC filings metadata...")
-            filings = sec_fetcher.fetch_filings_for_universe(universe, ticker_to_cik)
-
-            # Save filing metadata
-            with open(metadata_path, "w") as f:
-                json.dump(filings, f, indent=2)
-
-            total_filings = sum(len(f) for f in filings.values())
             progress.console.print(
-                f"[green]Fetched metadata for {total_filings} filings from {len(filings)} companies"
+                "[yellow]No filings file found. Fetching filings for universe..."
+            )
+
+            # Load ticker to CIK mapping
+            cache_file = settings.output_dir / "ticker_to_cik.json"
+            ticker_to_cik = load_ticker_to_cik_mapping(
+                universe.get_tickers(), str(cache_file)
+            )
+
+            # Fetch filings for universe
+            filings_df = sec_fetcher.fetch_filings_for_universe(universe, ticker_to_cik)
+
+            # Save filings to disk
+            filings_dir = settings.output_dir / "filings"
+            os.makedirs(filings_dir, exist_ok=True)
+            filings_file = sec_fetcher.save_filings_to_disk(
+                filings_df,
+                output_path=filings_dir,
+                file_format="parquet",
+                universe_name=settings.universe_name,
+            )
+
+            progress.console.print(
+                f"[green]Fetched and saved {len(filings_df)} filings for {filings_df['ticker'].nunique()} companies"
             )
 
         progress.update(filings_task, advance=1)
         progress.update(main_task, advance=1)
 
-        # Download and process actual filing content if depth > 1
-        if settings.kb_depth > 1:
-            processing_task = progress.add_task(
-                "[cyan]Processing filing contents...", total=1
-            )
-            processed = process_filing_contents(
-                sec_fetcher, filings, settings.output_dir, settings.verbose, logger
-            )
-            progress.console.print(
-                f"[green]Downloaded and processed {processed} filing documents"
-            )
-            progress.update(processing_task, advance=1)
+        # # Download and process actual filing content if depth > 1
+        # if settings.kb_depth > 1 and not filings_df.empty:
+        #     processing_task = progress.add_task(
+        #         "[cyan]Processing filing contents...", total=1
+        #     )
+        #     processed = process_filing_contents_from_df(
+        #         sec_fetcher, filings_df, settings.output_dir, settings.verbose, logger
+        #     )
+        #     progress.console.print(
+        #         f"[green]Downloaded and processed {processed} filing documents"
+        #     )
+        #     progress.update(processing_task, advance=1)
 
-        progress.update(main_task, advance=1)
+        # progress.update(main_task, advance=1)
 
-        # Temporarily replace the _ensure_index_exists method to prevent index creation
-        original_ensure_index = kb._ensure_index_exists
-        kb._ensure_index_exists = lambda: None  # Do nothing
+        # # Temporarily replace the _ensure_index_exists method to prevent index creation
+        # original_ensure_index = kb._ensure_index_exists
+        # kb._ensure_index_exists = lambda: None  # Do nothing
 
-        # Build the knowledge base from the filings
-        kb_build_task = progress.add_task(
-            "[cyan]Adding documents to knowledge base...",
-            total=len(universe.get_tickers()),
-        )
+        # # Build the knowledge base from the filings
+        # kb_build_task = progress.add_task(
+        #     "[cyan]Adding documents to knowledge base...",
+        #     total=len(universe.get_tickers()),
+        # )
 
-        document_count = 0
+        # document_count = 0
 
-        # Collect information for each security - modified to track progress
-        for ticker in universe.get_tickers():
-            security = universe.get_security(ticker)
+        # # Collect information for each security - modified to track progress
+        # for ticker in universe.get_tickers():
+        #     security = universe.get_security(ticker)
 
-            progress.console.print(f"[blue]Processing {ticker} ({security.name})")
+        #     progress.console.print(f"[blue]Processing {ticker} ({security.name})")
 
-            # Add basic company information
-            kb.add_document(
-                {
-                    "ticker": ticker,
-                    "text": f"Company overview: {security.name} operates in the {security.sector} sector.",
-                    "source": "company_profile",
-                    "date": f"{settings.end_year}-01-01",
-                    "section": "overview",
-                }
-            )
-            document_count += 1
+        #     # Add basic company information
+        #     kb.add_document(
+        #         {
+        #             "ticker": ticker,
+        #             "text": f"Company overview: {security.name} operates in the {security.sector} sector.",
+        #             "source": "company_profile",
+        #             "date": f"{settings.end_year}-01-01",
+        #             "section": "overview",
+        #         }
+        #     )
+        #     document_count += 1
 
-            # Process SEC filings if available
-            if ticker in filings:
-                ticker_filings = filings[ticker]
+        #     # Process SEC filings if available - updated for DataFrame
+        #     ticker_filings = (
+        #         filings_df[filings_df["ticker"] == ticker]
+        #         if not filings_df.empty
+        #         else pd.DataFrame()
+        #     )
 
-                filing_count = len(ticker_filings)
-                if filing_count > 0:
-                    progress.console.print(
-                        f"[dim]Found {filing_count} filings for {ticker}"
-                    )
+        #     filing_count = len(ticker_filings)
+        #     if filing_count > 0:
+        #         progress.console.print(
+        #             f"[dim]Found {filing_count} filings for {ticker}"
+        #         )
 
-                for filing in ticker_filings:
-                    filing_year = int(filing["filing_date"].split("-")[0])
+        #         for _, filing in ticker_filings.iterrows():
+        #             filing_date = filing["filing_date"]
+        #             if isinstance(filing_date, pd.Timestamp):
+        #                 filing_date = filing_date.strftime("%Y-%m-%d")
+        #                 filing_year = filing_date.split("-")[0]
+        #             else:
+        #                 filing_year = str(filing_date).split("-")[0]
 
-                    # Skip filings outside the specified year range
-                    if (
-                        filing_year < settings.start_year
-                        or filing_year > settings.end_year
-                    ):
-                        continue
+        #             filing_year = int(filing_year)
 
-                    filing_type = filing["filing_type"]
-                    filing_date = filing["filing_date"]
-                    accession_number = filing.get("accession_number", "")
-                    documents_url = filing.get("documents_url", "")
+        #             # Skip filings outside the specified year range
+        #             if (
+        #                 filing_year < settings.start_year
+        #                 or filing_year > settings.end_year
+        #             ):
+        #                 continue
 
-                    # Fetch and process the filing content
-                    filing_chunks = fetch_and_process_filing(
-                        ticker=ticker,
-                        filing_type=filing_type,
-                        filing_date=filing_date,
-                        accession_number=accession_number,
-                        documents_url=documents_url,
-                        output_dir=settings.output_dir,
-                        depth=settings.kb_depth,
-                        verbose=settings.verbose,
-                        logger=logger,
-                    )
+        #             # Get filing details from DataFrame columns
+        #             filing_type = "10-K"  # Our fetcher currently only gets 10-Ks
+        #             accession_number = filing.get("accessionNumber", "")
+        #             documents_url = filing.get("documents_url", "")
 
-                    # Add the processed chunks to the knowledge base
-                    for chunk in filing_chunks:
-                        kb.add_document(
-                            {
-                                "ticker": ticker,
-                                "text": chunk["text"],
-                                "source": f"{filing_type}_{accession_number}",
-                                "date": filing_date,
-                                "section": chunk.get("section", "unknown"),
-                            }
-                        )
-                        document_count += 1
-            else:
-                progress.console.print(f"[yellow]No filings found for {ticker}")
+        #             # Fetch and process the filing content
+        #             filing_chunks = fetch_and_process_filing(
+        #                 ticker=ticker,
+        #                 filing_type=filing_type,
+        #                 filing_date=filing_date,
+        #                 accession_number=accession_number,
+        #                 documents_url=documents_url,
+        #                 output_dir=settings.output_dir,
+        #                 depth=settings.kb_depth,
+        #                 verbose=settings.verbose,
+        #                 logger=logger,
+        #             )
 
-            # Update progress for this ticker
-            progress.update(kb_build_task, advance=1)
+        #             # Add the processed chunks to the knowledge base
+        #             for chunk in filing_chunks:
+        #                 kb.add_document(
+        #                     {
+        #                         "ticker": ticker,
+        #                         "text": chunk["text"],
+        #                         "source": f"{filing_type}_{accession_number}",
+        #                         "date": filing_date,
+        #                         "section": chunk.get("section", "unknown"),
+        #                     }
+        #                 )
+        #                 document_count += 1
+        #     else:
+        #         progress.console.print(f"[yellow]No filings found for {ticker}")
 
-        progress.update(main_task, advance=1)
+        #     # Update progress for this ticker
+        #     progress.update(kb_build_task, advance=1)
 
-        # Create index once after all documents are added (if we're not using KNN)
-        indexing_task = progress.add_task("[cyan]Building vector index...", total=1)
-        if kb.index_type in ["KNN", "FLAT"]:
-            progress.console.print(
-                f"[green]Using exhaustive kNN search for {document_count} documents - no index needed"
-            )
-        else:
-            progress.console.print(
-                f"[yellow]Creating vector index for {document_count} documents - this may take some time..."
-            )
-            # Restore original method and create index
-            kb._ensure_index_exists = original_ensure_index
-            kb._ensure_index_exists()
+        # progress.update(main_task, advance=1)
 
-        progress.update(indexing_task, advance=1)
-        progress.update(main_task, advance=1)
-        progress.console.print("[bold green]Knowledge base built successfully!")
+        # # Create index once after all documents are added (if we're not using KNN)
+        # indexing_task = progress.add_task("[cyan]Building vector index...", total=1)
+        # if kb.index_type in ["KNN", "FLAT"]:
+        #     progress.console.print(
+        #         f"[green]Using exhaustive kNN search for {document_count} documents - no index needed"
+        #     )
+        # else:
+        #     progress.console.print(
+        #         f"[yellow]Creating vector index for {document_count} documents - this may take some time..."
+        #     )
+        #     # Restore original method and create index
+        #     kb._ensure_index_exists = original_ensure_index
+        #     kb._ensure_index_exists()
+
+        # progress.update(indexing_task, advance=1)
+        # progress.update(main_task, advance=1)
+        # progress.console.print("[bold green]Knowledge base built successfully!")
 
     return kb
 

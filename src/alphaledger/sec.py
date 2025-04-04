@@ -6,7 +6,11 @@ from bs4 import BeautifulSoup
 import pandas as pd
 from typing import Dict, List, Optional
 from datetime import datetime
-from alphaledger.config import settings
+from alphaledger.config import settings, console
+from alphaledger.universe import Universe
+from alphaledger import get_logger
+
+logger = get_logger(__name__)
 
 
 def download_ticker_to_cik_mapping(output_path: Optional[str] = None) -> Dict[str, str]:
@@ -79,19 +83,30 @@ def load_ticker_to_cik_mapping(
 
 
 class EDGARFetcher:
-    def __init__(self, user_agent=None):
+    def __init__(self, user_agent=None, cache_dir=settings.output_dir / "cache"):
         """
         Initialize the EDGAR fetcher with your contact information.
 
         Args:
             user_agent (str, optional): Your name, email, and organization as required by SEC
                                        If None, uses the value from settings
+            cache_dir (str, optional): Directory to store the XBRL cache
         """
         # Use provided user_agent or fall back to settings
         self.headers = {"User-Agent": user_agent or settings.sec_user_agent}
         self.base_url = settings.sec_base_url
         # Respect SEC rate limits (10 requests per second)
         self.request_interval = settings.sec_request_interval
+        # Set up cache directory
+        self.cache_dir = cache_dir or settings.output_dir / "cache"
+
+        # Initialize HTTP cache for XBRL parsing
+        from xbrl.cache import HttpCache
+
+        # Convert Path object to string to avoid the endswith() error
+        cache_dir_str = str(self.cache_dir)
+        self.cache = HttpCache(cache_dir_str)
+        self.cache.set_headers({"User-Agent": self.headers["User-Agent"]})
 
     def get_company_filings(self, cik):
         """
@@ -107,39 +122,45 @@ class EDGARFetcher:
         cik_formatted = str(cik).zfill(10)
         url = f"https://data.sec.gov/submissions/CIK{cik_formatted}.json"
 
-        print(f"Fetching filings from: {url}")
+        logger.info(f"Fetching filings from: {url}")
+
+        # console.print(f"[bold magenta]Fetching filings from: {url}[/bold magenta]")
         time.sleep(self.request_interval)  # Respect rate limits
         response = requests.get(url, headers=self.headers)
 
         if response.status_code == 200:
+            logger.info(f"Successfully fetched filings: {response.json}")
             return response.json()
         else:
-            print(f"Error fetching filings: {response.status_code} - {response.reason}")
+            logger.error(
+                f"[bold red]Error fetching filings: {response.status_code} - {response.reason}[/bold red]"
+            )
             return None
 
-    def search_10k_filings(self, cik, year=None, start_year=None, end_year=None):
+    def search_10k_filings(
+        self, ticker, cik, year=None, start_year=None, end_year=None
+    ) -> pd.DataFrame:
         """
         Search for 10-K filings for a specific company using the SEC submissions API.
 
         Args:
+            ticker (str): The ticker symbol of the company
             cik (str): The CIK number of the company
             year (int, optional): Filter by specific filing year
             start_year (int, optional): Start year for filing search range
             end_year (int, optional): End year for filing search range
 
         Returns:
-            A list of 10-K filing data
+            A DataFrame of 10-K filing data
         """
         # Get all filings for the company
         filings_data = self.get_company_filings(cik)
         if not filings_data:
-            return []
-
-        results = []
+            return pd.DataFrame()
 
         # The recent filings are in the "filings" section
         if "filings" not in filings_data or "recent" not in filings_data["filings"]:
-            return []
+            return pd.DataFrame()
 
         recent_filings = filings_data["filings"]["recent"]
 
@@ -147,42 +168,71 @@ class EDGARFetcher:
         if not all(
             key in recent_filings for key in ["form", "filingDate", "accessionNumber"]
         ):
-            print("Warning: Filing data structure is not as expected")
-            return []
+            console.print(
+                "[bold yellow]Warning: Filing data structure is not as expected[/bold yellow]"
+            )
+            return pd.DataFrame()
 
-        # Extract 10-K filings
-        for i, form_type in enumerate(recent_filings["form"]):
-            if form_type == "10-K":
-                filing_date = recent_filings["filingDate"][i]
-                filing_year = int(filing_date.split("-")[0])
+        # Create DataFrame from recent filings
+        filings_df = pd.DataFrame(recent_filings)
 
-                # Filter by year if specified
-                if year and filing_year != year:
-                    continue
-                if (
-                    start_year
-                    and end_year
-                    and not (start_year <= filing_year <= end_year)
-                ):
-                    continue
+        # Filter only 10-K filings
+        form_10k_df = filings_df[filings_df["form"] == "10-K"].copy()
 
-                acc_no = recent_filings["accessionNumber"][i]
+        # Extract filing year from filing date
+        form_10k_df["filing_year"] = (
+            form_10k_df["filingDate"].str.split("-").str[0].astype(int)
+        )
+        form_10k_df["filing_date"] = pd.to_datetime(form_10k_df["filingDate"])
+        form_10k_df["report_date"] = pd.to_datetime(form_10k_df["reportDate"])
 
-                # Create a filing entry
-                filing = {
-                    "filing_type": form_type,
-                    "filing_date": filing_date,
-                    "accession_number": acc_no,
-                    "cik": str(cik).zfill(10),
-                    # Generate the documents URL
-                    "documents_url": f"https://www.sec.gov/Archives/edgar/data/{str(cik).zfill(10)}/{acc_no.replace('-', '')}/{acc_no}-index.html",
-                }
+        # Apply year filters if specified
+        if year is not None:
+            form_10k_df = form_10k_df[form_10k_df["filing_year"] == year]
+        elif start_year is not None and end_year is not None:
+            form_10k_df = form_10k_df[
+                (form_10k_df["filing_year"] >= start_year)
+                & (form_10k_df["filing_year"] <= end_year)
+            ]
 
-                results.append(filing)
+        # Format CIK with leading zeros
+        cik_formatted = str(cik).zfill(10)
 
-        return results
+        # Create a copy to avoid DataFrame warnings
+        form_10k_df = form_10k_df.copy()
 
-    def fetch_filings_for_universe(self, universe, ticker_to_cik_mapping):
+        # Add each column individually using vectorized operations where possible
+        form_10k_df["cik"] = cik_formatted
+        form_10k_df["ticker"] = ticker
+
+        # Generate document URLs - using vectorized string operations
+        form_10k_df["documents_url"] = (
+            "https://www.sec.gov/Archives/edgar/data/"
+            + cik_formatted
+            + "/"
+            + form_10k_df["accessionNumber"].str.replace("-", "")
+            + "/"
+            + form_10k_df["accessionNumber"]
+            + "-index.html"
+        )
+
+        # Generate XBRL URLs - using a list comprehension instead of apply
+        xbrl_urls = []
+        for i, row in form_10k_df.iterrows():
+            acc = row["accessionNumber"]
+            if pd.isna(row["report_date"]):
+                # Handle missing report date
+                xbrl_urls.append(None)
+            else:
+                date_str = row["report_date"].strftime("%Y%m%d")
+                xbrl_url = f"https://www.sec.gov/Archives/edgar/data/{cik_formatted}/{acc.replace('-', '')}/{ticker.lower()}-{date_str}.htm"
+                xbrl_urls.append(xbrl_url)
+
+        form_10k_df["xbrl_root_url"] = xbrl_urls
+
+        return form_10k_df
+
+    def fetch_filings_for_universe(self, universe: Universe, ticker_to_cik_mapping):
         """
         Fetch 10-K filings for all securities in a Universe.
 
@@ -191,9 +241,9 @@ class EDGARFetcher:
             ticker_to_cik_mapping: Dictionary mapping tickers to CIK numbers
 
         Returns:
-            Dictionary mapping tickers to their filing data
+            DataFrame containing all filings for the universe
         """
-        all_filings = {}
+        all_filings_dfs = []
         filing_years = universe.get_filing_years()
 
         # Use default range of last 3 years if no filing years specified
@@ -201,8 +251,8 @@ class EDGARFetcher:
             current_year = datetime.now().year
             start_year = current_year - 3
             end_year = current_year
-            print(
-                f"No filing years specified in universe. Using default range: {start_year}-{end_year}"
+            console.print(
+                f"[bold magenta]No filing years specified in universe. Using default range: {start_year}-{end_year}[/bold magenta]"
             )
         else:
             start_year = min(filing_years)
@@ -214,25 +264,125 @@ class EDGARFetcher:
                 # Ensure CIK is properly formatted with leading zeros
                 cik_formatted = str(cik).zfill(10)
 
-                print(
+                console.print(
                     f"Searching for {ticker} (CIK: {cik_formatted}) filings between {start_year}-{end_year}"
                 )
 
-                filings = self.search_10k_filings(
-                    cik_formatted, start_year=start_year, end_year=end_year
+                filings_df = self.search_10k_filings(
+                    ticker, cik_formatted, start_year=start_year, end_year=end_year
                 )
 
-                all_filings[ticker] = filings
-                print(
-                    f"Found {len(filings)} 10-K filings for {ticker} between {start_year}-{end_year}"
-                )
+                if not filings_df.empty:
+                    all_filings_dfs.append(filings_df)
+                    print(
+                        f"Found {len(filings_df)} 10-K filings for {ticker} between {start_year}-{end_year}"
+                    )
+
                 time.sleep(
                     self.request_interval * 2
                 )  # Additional delay between companies
             else:
                 print(f"Warning: No CIK found for ticker {ticker}")
 
-        return all_filings
+        # Combine all DataFrames into a single one
+        if all_filings_dfs:
+            combined_df = pd.concat(all_filings_dfs, ignore_index=True)
+            # Add processing date/time as metadata
+            combined_df["processed_date"] = datetime.now()
+            return combined_df
+        else:
+            return pd.DataFrame()  # Return empty DataFrame if no filings found
+
+    def save_filings_to_disk(
+        self,
+        filings_df,
+        output_path=None,
+        file_format="parquet",
+        universe_name="universe",
+    ):
+        """
+        Save the filings DataFrame to disk.
+
+        Args:
+            filings_df: DataFrame containing the filings data
+            output_path: Path where the file should be saved
+            file_format: Format to save the file (parquet or csv)
+            universe_name: Name of the universe (used in filename)
+
+        Returns:
+            Path to the saved file
+        """
+        if filings_df.empty:
+            print("No filings to save.")
+            return None
+
+        # Set default output directory
+        if output_path is None:
+            output_path = settings.output_dir / "filings"
+
+        # Ensure output_path is a Path object for consistent handling
+        from pathlib import Path
+
+        output_path = Path(output_path)
+
+        # Create the directory
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # Generate filename, ensuring we don't use a name that's already a directory
+        base_filename = f"sec_filings_{universe_name}"
+
+        # Check if the intended file path is already a directory
+        if (output_path / base_filename).is_dir():
+            # If it's a directory, add a timestamp to make the filename unique
+            from datetime import datetime
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_filename = f"{base_filename}_{timestamp}"
+
+        # Create full file path with filename and extension
+        if file_format.lower() == "parquet":
+            file_path = output_path / f"{base_filename}.parquet"
+        else:
+            file_path = output_path / f"{base_filename}.csv"
+
+        # Convert to string for pandas
+        file_path_str = str(file_path)
+
+        # Ensure the parent directory exists
+        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # Save based on format
+        if file_format.lower() == "parquet":
+            filings_df.to_parquet(file_path_str)
+            print(f"Saved {len(filings_df)} filings to {file_path_str}")
+        else:
+            # CSV format
+            filings_df.to_csv(file_path_str, index=False)
+            print(f"Saved {len(filings_df)} filings to {file_path_str}")
+
+        return file_path_str
+
+    def load_filings_from_disk(self, file_path=settings.output_dir / "filings"):
+        """
+        Load filings from a saved file.
+
+        Args:
+            file_path: Path to the saved filings file
+
+        Returns:
+            DataFrame containing the filings data
+        """
+        if not os.path.exists(file_path):
+            print(f"File not found: {file_path}")
+            return pd.DataFrame()
+
+        if file_path.endswith(".parquet"):
+            return pd.read_parquet(file_path)
+        elif file_path.endswith(".csv"):
+            return pd.read_csv(file_path)
+        else:
+            print(f"Unsupported file format: {file_path}")
+            return pd.DataFrame()
 
     def get_filing_by_accession_number(self, cik, accession_number, file_type="10-K"):
         """
@@ -291,6 +441,29 @@ class EDGARFetcher:
                     return soup.get_text()
 
         return "No text content found in the filing."
+
+    def parse_filing_xbrl(self, row):
+        """
+        Parse an XBRL filing using the schema and document URLs.
+
+        Args:
+            row: DataFrame row containing 'documents_url' and 'xbrl_root_url'
+
+        Returns:
+            XbrlInstance object for the filing
+        """
+        from xbrl.instance import XbrlParser, XbrlInstance
+
+        parser = XbrlParser(self.cache)
+        try:
+            schema_url = row["xbrl_root_url"]
+            inst = parser.parse_instance(schema_url)
+            return inst
+        except Exception as e:
+            print(
+                f"Error parsing XBRL for {row['ticker']} ({row['filing_date']}): {str(e)}"
+            )
+            return None
 
 
 # Example usage

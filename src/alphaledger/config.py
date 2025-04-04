@@ -4,9 +4,11 @@ from pydantic import Field, field_validator, AliasChoices
 from typing import Optional, Literal
 import os
 
-from rich import print
-from rich.console import Console
 from pydantic import BaseModel, ValidationError
+
+from rich.console import Console
+
+console = Console()
 
 
 class AlphaLedgerSettings(BaseSettings):
@@ -19,6 +21,12 @@ class AlphaLedgerSettings(BaseSettings):
         extra="ignore",
         cli_parse_args=True,  # Enable command-line parsing
         cli_kebab_case=True,  # Use kebab-case for CLI arguments
+    )
+
+    # Base directory for AlphaLedger
+    root: Path = Field(
+        default=None,
+        description="root path for AlphaLedger",
     )
 
     # Base directory for universes
@@ -112,40 +120,66 @@ class AlphaLedgerSettings(BaseSettings):
         description="GPU acceleration for index building ('cuda' for NVIDIA GPUs, 'mps' for Apple Silicon)",
     )
 
-    @field_validator("universe_dir", "output_dir", mode="before")
-    def convert_to_path(cls, v):
-        """Convert string paths to Path objects"""
+    # Define a helper to get the project root
+    @classmethod
+    def get_project_root(cls):
+        """Returns the absolute path to the project root."""
+        # Start from the current file and go up three levels (src/alphaledger/config.py -> project root)
+        return Path(__file__).parent.parent.parent.resolve()
+
+    @field_validator("root", mode="after")
+    def validate_root(cls, v):
+        """Ensure root is an absolute path if provided"""
         if v is not None:
-            return Path(v)
-        return v
+            if not isinstance(v, Path):
+                v = Path(v)
+            if not v.is_absolute():
+                v = Path(os.path.abspath(v))
+                return v
+            return v.resolve()
+
+        # If root is not provided, use current working directory
+        return Path.cwd()
 
     @field_validator("universe_dir", mode="after")
-    def set_default_universe_dir(cls, v):
+    def set_default_universe_dir(cls, v, info):
         """Set default universe directory if not provided"""
         if v is not None:
-            return v
+            # If universe_dir was provided (including from environment variables),
+            # ensure it's an absolute path
+            if not isinstance(v, Path):
+                v = Path(v)
+            if not v.is_absolute():
+                v = Path.cwd() / v
+            return v.resolve()
 
-        # Check if set in environment first
-        env_var = os.environ.get("ALPHALEDGER_UNIVERSE_DIR")
-        if env_var:
-            return Path(env_var)
+        # Use root if provided
+        root = info.data.get("root")
+        if root:
+            return root / "universes"
 
-        # Default to project structure if not specified
-        return Path(__file__).parent.parent.parent / "universes"
+        # Default to a directory within current working directory
+        return (Path.cwd() / "universes").resolve()
 
     @field_validator("output_dir", mode="after")
-    def set_default_output_dir(cls, v):
+    def set_default_output_dir(cls, v, info):
         """Set default output directory if not provided"""
         if v is not None:
-            return v
+            # If output_dir was provided (including from environment variables),
+            # ensure it's an absolute path
+            if not isinstance(v, Path):
+                v = Path(v)
+            if not v.is_absolute():
+                v = Path.cwd() / v
+            return v.resolve()
 
-        # Check if set in environment first
-        env_var = os.environ.get("ALPHALEDGER_OUTPUT_DIR")
-        if env_var:
-            return Path(env_var)
+        # Use root if provided
+        root = info.data.get("root")
+        if root:
+            return root / "output"
 
-        # Default to project structure if not specified
-        return Path(__file__).parent.parent.parent / "output"
+        # Default to a directory within current working directory
+        return (Path.cwd() / "output").resolve()
 
     @field_validator("kb_index_num_bits")
     def validate_num_bits(cls, v):
@@ -175,9 +209,6 @@ class AlphaLedgerSettings(BaseSettings):
         return "output/kb_data"  # Fallback default
 
 
-console = Console()
-
-
 def print_pydantic_errors(e: ValidationError):
     console.print("[bold red]Validation Errors[/bold red]")
     for error in e.errors():
@@ -194,7 +225,19 @@ def print_pydantic_errors(e: ValidationError):
 
 
 try:
+    # resolve env file (if used from a notebook we will walk up the directory tree to find the .env file)
+    env_file = None
+    _depth = 3
+    while not env_file and _depth > 0:
+        if os.path.exists(".env"):
+            env_file = ".env"
+        else:
+            os.chdir("..")
+            _depth -= 1
+    console.print(
+        f"[bold magenta]Using env file at {os.path.abspath(env_file)}[/bold magenta]"
+    )
     # Create a global settings instance
-    settings = AlphaLedgerSettings()
+    settings = AlphaLedgerSettings(env_file=env_file)
 except ValidationError as e:
     print_pydantic_errors(e)
