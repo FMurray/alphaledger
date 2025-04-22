@@ -285,3 +285,62 @@ class PlainTextFormatter(DocumentFormatter):
                 context_str = f" Context: {context_display}"
 
             return f"[FACT: {fact.concept.name}={fact.value}{unit_str}{period_str}{context_str}]\n"
+
+
+class DeltaLakeFormatter(DocumentFormatter):
+    def __init__(self, spark_session, table_name: str):
+        self.spark = spark_session
+        self.table_name = table_name
+        self.rows = []
+
+    def format_fact_part(self, part: "DocumentPart") -> str:
+        fact = cast(AbstractFact, part.content)
+
+        # Create base row with common fields
+        row = {
+            "concept_name": fact.concept.name,
+            "concept_namespace": fact.concept.schema_url.split("/")[
+                -2
+            ],  # e.g., us-gaap
+            "fact_value": str(fact.value),
+            "fact_type": type(fact).__name__,
+            "section_name": self.current_section.title
+            if hasattr(self, "current_section")
+            else None,
+        }
+
+        # Add unit if present
+        if hasattr(fact, "unit") and fact.unit:
+            row["unit"] = str(fact.unit)
+
+        # Add period information
+        if hasattr(fact, "period"):
+            if hasattr(fact.period, "instant"):
+                row["period_instant"] = fact.period.instant
+            elif hasattr(fact.period, "start_date") and hasattr(
+                fact.period, "end_date"
+            ):
+                row["period_start"] = fact.period.start_date
+                row["period_end"] = fact.period.end_date
+
+        # Add context if present
+        if hasattr(fact, "context") and fact.context:
+            row["context_id"] = fact.context.id
+
+        # Add any additional metadata
+        metadata = {}
+        if hasattr(fact, "decimals"):
+            metadata["decimals"] = str(fact.decimals)
+        if hasattr(fact, "precision"):
+            metadata["precision"] = str(fact.precision)
+        row["metadata"] = metadata
+
+        self.rows.append(row)
+        return ""  # No string output needed for Delta Lake
+
+    def save_to_delta(self):
+        # Convert rows to DataFrame
+        df = self.spark.createDataFrame(self.rows)
+
+        # Write to Delta table
+        df.write.format("delta").mode("append").saveAsTable(self.table_name)

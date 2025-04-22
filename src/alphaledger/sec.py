@@ -2,15 +2,32 @@ import requests
 import time
 import os
 import json
+import polars as pl
 from bs4 import BeautifulSoup
-import pandas as pd
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union, TYPE_CHECKING
 from datetime import datetime
-from alphaledger.config import settings, console
-from alphaledger.universe import Universe
+from alphaledger.config import settings
 from alphaledger import get_logger
+from pathlib import Path
+from dataclasses import dataclass
+from datetime import date
+import deltalake
+
+# --- Add TYPE_CHECKING block for Universe import ---
+if TYPE_CHECKING:
+    from alphaledger.universe import Universe
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class CoreFilingMetadata:
+    ticker: str
+    filing_date: date
+    filing_type: str
+    filing_id: str
+    cik: str
+    accession_number: str
 
 
 def download_ticker_to_cik_mapping(output_path: Optional[str] = None) -> Dict[str, str]:
@@ -38,8 +55,10 @@ def download_ticker_to_cik_mapping(output_path: Optional[str] = None) -> Dict[st
 
     # Save mapping to file if requested
     if output_path:
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        with open(output_path, "w") as f:
+        # Ensure output_path is a Path object before using parent
+        output_path_obj = Path(output_path)
+        os.makedirs(output_path_obj.parent, exist_ok=True)
+        with open(output_path_obj, "w") as f:
             json.dump(mapping, f, indent=2)
 
     return mapping
@@ -67,17 +86,31 @@ def load_ticker_to_cik_mapping(
 
     # Load the full mapping
     if use_cache:
-        with open(cache_file, "r") as f:
-            full_mapping = json.load(f)
+        try:
+            with open(cache_file, "r") as f:
+                full_mapping = json.load(f)
+        except json.JSONDecodeError:
+            logger.warning(f"Cache file {cache_file} is corrupted. Re-downloading.")
+            full_mapping = download_ticker_to_cik_mapping(
+                cache_file
+            )  # Re-download if corrupt
     else:
         full_mapping = download_ticker_to_cik_mapping(cache_file)
 
     # Filter to just the tickers we need
     result = {}
+    missing_tickers = []
     for ticker in tickers:
         upper_ticker = ticker.upper()
         if upper_ticker in full_mapping:
             result[ticker] = full_mapping[upper_ticker]
+        else:
+            missing_tickers.append(ticker)
+
+    if missing_tickers:
+        logger.warning(
+            f"Could not find CIKs for the following tickers: {', '.join(missing_tickers)}"
+        )
 
     return result
 
@@ -98,12 +131,15 @@ class EDGARFetcher:
         # Respect SEC rate limits (10 requests per second)
         self.request_interval = settings.sec_request_interval
         # Set up cache directory
-        self.cache_dir = cache_dir or settings.output_dir / "cache"
+        self.cache_dir = Path(
+            cache_dir or settings.output_dir / "cache"
+        )  # Ensure Path object
 
         # Initialize HTTP cache for XBRL parsing
         from xbrl.cache import HttpCache
 
         # Convert Path object to string to avoid the endswith() error
+        # HttpCache might expect a string path
         cache_dir_str = str(self.cache_dir)
         self.cache = HttpCache(cache_dir_str)
         self.cache.set_headers({"User-Agent": self.headers["User-Agent"]})
@@ -122,24 +158,35 @@ class EDGARFetcher:
         cik_formatted = str(cik).zfill(10)
         url = f"https://data.sec.gov/submissions/CIK{cik_formatted}.json"
 
-        logger.info(f"Fetching filings from: {url}")
+        logger.info(f"Fetching filings index from: {url}")
 
-        # console.print(f"[bold magenta]Fetching filings from: {url}[/bold magenta]")
+        # console.print(f"[bold magenta]Fetching filings from: {url}[/bold magenta]") # Replaced with logger
         time.sleep(self.request_interval)  # Respect rate limits
-        response = requests.get(url, headers=self.headers)
-
-        if response.status_code == 200:
-            logger.info(f"Successfully fetched filings: {response.json}")
+        try:
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+            logger.info(f"Successfully fetched filings index for CIK {cik_formatted}")
             return response.json()
-        else:
+        except requests.exceptions.RequestException as e:
             logger.error(
-                f"[bold red]Error fetching filings: {response.status_code} - {response.reason}[/bold red]"
+                # f"[bold red]Error fetching filings: {response.status_code} - {response.reason}[/bold red]" # Replaced with logger format
+                f"Error fetching filings index for CIK {cik_formatted} from {url}: {e}"
+            )
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"Error decoding JSON response for CIK {cik_formatted} from {url}: {e}"
             )
             return None
 
     def search_10k_filings(
-        self, ticker, cik, year=None, start_year=None, end_year=None
-    ) -> pd.DataFrame:
+        self,
+        ticker: str,
+        cik: str,
+        year: Optional[int] = None,
+        start_year: Optional[int] = None,
+        end_year: Optional[int] = None,
+    ) -> pl.DataFrame:  # Updated return type
         """
         Search for 10-K filings for a specific company using the SEC submissions API.
 
@@ -151,88 +198,185 @@ class EDGARFetcher:
             end_year (int, optional): End year for filing search range
 
         Returns:
-            A DataFrame of 10-K filing data
+            A Polars DataFrame of 10-K filing data
         """
         # Get all filings for the company
         filings_data = self.get_company_filings(cik)
         if not filings_data:
-            return pd.DataFrame()
+            return pl.DataFrame()  # Return empty Polars DF
 
         # The recent filings are in the "filings" section
         if "filings" not in filings_data or "recent" not in filings_data["filings"]:
-            return pd.DataFrame()
+            logger.warning(
+                f"Unexpected JSON structure for CIK {cik}. 'filings' or 'recent' key missing."
+            )
+            return pl.DataFrame()  # Return empty Polars DF
 
         recent_filings = filings_data["filings"]["recent"]
 
-        # Check if we have the necessary data
-        if not all(
-            key in recent_filings for key in ["form", "filingDate", "accessionNumber"]
-        ):
-            console.print(
-                "[bold yellow]Warning: Filing data structure is not as expected[/bold yellow]"
+        # Define expected columns and types for Polars DataFrame creation
+        # Use Polars types
+        expected_schema = {
+            "accessionNumber": pl.Utf8,
+            "filingDate": pl.Utf8,  # Keep as string initially for processing
+            "reportDate": pl.Utf8,  # Keep as string initially for processing
+            "form": pl.Utf8,
+            "primaryDocument": pl.Utf8,
+            "primaryDocDescription": pl.Utf8,
+            # Add other potential columns if needed, otherwise Polars handles unknowns
+        }
+
+        try:
+            # Create Polars DataFrame directly from the list of dicts
+            filings_df = pl.DataFrame(recent_filings, schema_overrides=expected_schema)
+        except Exception as e:
+            logger.error(
+                f"Error creating Polars DataFrame from SEC filings data for CIK {cik}: {e}"
             )
-            return pd.DataFrame()
+            return pl.DataFrame()  # Return empty Polars DF
 
-        # Create DataFrame from recent filings
-        filings_df = pd.DataFrame(recent_filings)
+        # Check if essential columns exist after creation
+        # Ensure primaryDocument exists as it's now needed for the URL
+        required_cols = [
+            "form",
+            "filingDate",
+            "reportDate",
+            "accessionNumber",
+            "primaryDocument",
+        ]
+        if not all(col in filings_df.columns for col in required_cols):
+            logger.warning(
+                f"Filing data structure is missing some required columns for CIK {cik} (incl. primaryDocument). Found: {filings_df.columns}"
+            )
+            # Return empty if critical columns are missing
+            if not all(
+                col in filings_df.columns
+                for col in ["form", "accessionNumber", "primaryDocument"]
+            ):
+                return pl.DataFrame()
 
-        # Filter only 10-K filings
-        form_10k_df = filings_df[filings_df["form"] == "10-K"].copy()
+        # Filter only 10-K filings using Polars filter
+        form_10k_df = filings_df.filter(pl.col("form") == "10-K")
 
-        # Extract filing year from filing date
-        form_10k_df["filing_year"] = (
-            form_10k_df["filingDate"].str.split("-").str[0].astype(int)
-        )
-        form_10k_df["filing_date"] = pd.to_datetime(form_10k_df["filingDate"])
-        form_10k_df["report_date"] = pd.to_datetime(form_10k_df["reportDate"])
+        if form_10k_df.is_empty():
+            logger.info(f"No 10-K filings found in the recent filings for CIK {cik}.")
+            return pl.DataFrame()  # Return empty Polars DF
 
-        # Apply year filters if specified
+        # Process dates and add columns using Polars `with_columns`
+        # Use Polars expressions for transformations
+        try:
+            form_10k_df = form_10k_df.with_columns(
+                [
+                    # Extract filing year
+                    pl.col("filingDate")
+                    .str.split("-")
+                    .list.get(0)
+                    .cast(pl.Int64)
+                    .alias("filing_year"),
+                    # Convert filingDate to Date type
+                    pl.col("filingDate")
+                    .str.strptime(pl.Date, "%Y-%m-%d", strict=False)
+                    .alias("filing_date_dt"),
+                    # Convert reportDate to Date type, handling potential errors
+                    pl.col("reportDate")
+                    .str.strptime(pl.Date, "%Y-%m-%d", strict=False)
+                    .alias("report_date_dt"),
+                ]
+            )
+        except Exception as e:
+            logger.error(
+                f"Error processing dates for CIK {cik}: {e}. Some date conversions might fail."
+            )
+            # Continue processing, but be aware dates might be null
+
+        # Apply year filters if specified using Polars filter
         if year is not None:
-            form_10k_df = form_10k_df[form_10k_df["filing_year"] == year]
+            form_10k_df = form_10k_df.filter(pl.col("filing_year") == year)
         elif start_year is not None and end_year is not None:
-            form_10k_df = form_10k_df[
-                (form_10k_df["filing_year"] >= start_year)
-                & (form_10k_df["filing_year"] <= end_year)
-            ]
+            form_10k_df = form_10k_df.filter(
+                (pl.col("filing_year") >= start_year)
+                & (pl.col("filing_year") <= end_year)
+            )
+
+        if form_10k_df.is_empty():
+            logger.info(
+                f"No 10-K filings found for CIK {cik} matching the year filter ({year or f'{start_year}-{end_year}'})."
+            )
+            return pl.DataFrame()  # Return empty Polars DF
 
         # Format CIK with leading zeros
         cik_formatted = str(cik).zfill(10)
 
-        # Create a copy to avoid DataFrame warnings
-        form_10k_df = form_10k_df.copy()
+        # Add remaining columns using Polars `with_columns`
+        # Generate URLs using Polars string expressions
+        try:
+            form_10k_df = form_10k_df.with_columns(
+                [
+                    pl.lit(cik_formatted).alias("cik"),  # Add cik column
+                    pl.lit(ticker).alias("ticker"),  # Add ticker column
+                    # Generate document URLs (index page)
+                    (
+                        pl.lit("https://www.sec.gov/Archives/edgar/data/")
+                        + pl.lit(cik_formatted)
+                        + "/"
+                        + pl.col("accessionNumber").str.replace_all("-", "")
+                        + "/"
+                        + pl.col("accessionNumber")
+                        + "-index.html"
+                    ).alias("documents_url"),
+                    # Generate direct URL to the primary document (often the iXBRL/HTML file)
+                    pl.when(
+                        pl.col("primaryDocument").is_not_null()
+                        & (pl.col("primaryDocument") != "")
+                    )
+                    .then(
+                        pl.lit("https://www.sec.gov/Archives/edgar/data/")
+                        + pl.lit(cik_formatted)
+                        + "/"
+                        + pl.col("accessionNumber").str.replace_all("-", "")
+                        + "/"
+                        + pl.col(
+                            "primaryDocument"
+                        )  # Use the primaryDocument filename directly
+                    )
+                    .otherwise(None)  # Set to null if primaryDocument is missing/empty
+                    .alias(
+                        "xbrl_instance_url"
+                    ),  # Keep alias name for consistency downstream
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Error adding CIK, Ticker, or URL columns for CIK {cik}: {e}")
+            # Return the DataFrame as is, but URLs might be missing/incorrect
 
-        # Add each column individually using vectorized operations where possible
-        form_10k_df["cik"] = cik_formatted
-        form_10k_df["ticker"] = ticker
-
-        # Generate document URLs - using vectorized string operations
-        form_10k_df["documents_url"] = (
-            "https://www.sec.gov/Archives/edgar/data/"
-            + cik_formatted
-            + "/"
-            + form_10k_df["accessionNumber"].str.replace("-", "")
-            + "/"
-            + form_10k_df["accessionNumber"]
-            + "-index.html"
-        )
-
-        # Generate XBRL URLs - using a list comprehension instead of apply
-        xbrl_urls = []
-        for i, row in form_10k_df.iterrows():
-            acc = row["accessionNumber"]
-            if pd.isna(row["report_date"]):
-                # Handle missing report date
-                xbrl_urls.append(None)
-            else:
-                date_str = row["report_date"].strftime("%Y%m%d")
-                xbrl_url = f"https://www.sec.gov/Archives/edgar/data/{cik_formatted}/{acc.replace('-', '')}/{ticker.lower()}-{date_str}.htm"
-                xbrl_urls.append(xbrl_url)
-
-        form_10k_df["xbrl_root_url"] = xbrl_urls
+        # Select and reorder columns for final output
+        final_columns = [
+            "ticker",
+            "cik",
+            "form",
+            "accessionNumber",
+            "filingDate",
+            "filing_date_dt",
+            "filing_year",
+            "reportDate",
+            "report_date_dt",
+            "primaryDocument",
+            "primaryDocDescription",
+            "documents_url",
+            "xbrl_instance_url",
+        ]
+        # Filter to only columns that actually exist in the df, in the desired order
+        final_columns = [col for col in final_columns if col in form_10k_df.columns]
+        form_10k_df = form_10k_df.select(final_columns)
 
         return form_10k_df
 
-    def fetch_filings_for_universe(self, universe: Universe, ticker_to_cik_mapping):
+    def fetch_filings_for_universe(
+        # Use the TYPE_CHECKING import here for the type hint
+        self,
+        universe: "Universe",
+        ticker_to_cik_mapping: Dict[str, str],
+    ) -> pl.DataFrame:  # Updated return type
         """
         Fetch 10-K filings for all securities in a Universe.
 
@@ -241,18 +385,18 @@ class EDGARFetcher:
             ticker_to_cik_mapping: Dictionary mapping tickers to CIK numbers
 
         Returns:
-            DataFrame containing all filings for the universe
+            Polars DataFrame containing all filings for the universe
         """
-        all_filings_dfs = []
+        all_filings_dfs: List[pl.DataFrame] = []  # List to hold Polars DataFrames
         filing_years = universe.get_filing_years()
 
-        # Use default range of last 3 years if no filing years specified
+        # Use default range if no filing years specified
         if not filing_years:
             current_year = datetime.now().year
-            start_year = current_year - 3
+            start_year = current_year - 3  # Default to last 3 years + current
             end_year = current_year
-            console.print(
-                f"[bold magenta]No filing years specified in universe. Using default range: {start_year}-{end_year}[/bold magenta]"
+            logger.info(
+                f"No filing years specified in universe '{universe.name}'. Using default range: {start_year}-{end_year}"
             )
         else:
             start_year = min(filing_years)
@@ -261,128 +405,172 @@ class EDGARFetcher:
         for ticker in universe.get_tickers():
             if ticker in ticker_to_cik_mapping:
                 cik = ticker_to_cik_mapping[ticker]
-                # Ensure CIK is properly formatted with leading zeros
+                # Ensure CIK is properly formatted
                 cik_formatted = str(cik).zfill(10)
 
-                console.print(
+                logger.info(
                     f"Searching for {ticker} (CIK: {cik_formatted}) filings between {start_year}-{end_year}"
                 )
 
+                # This now returns a Polars DataFrame
                 filings_df = self.search_10k_filings(
                     ticker, cik_formatted, start_year=start_year, end_year=end_year
                 )
 
-                if not filings_df.empty:
+                if not filings_df.is_empty():  # Use Polars is_empty()
                     all_filings_dfs.append(filings_df)
-                    print(
+                    logger.info(
                         f"Found {len(filings_df)} 10-K filings for {ticker} between {start_year}-{end_year}"
+                    )
+                else:
+                    logger.info(
+                        f"No 10-K filings found for {ticker} in period {start_year}-{end_year}."
                     )
 
                 time.sleep(
-                    self.request_interval * 2
-                )  # Additional delay between companies
+                    self.request_interval
+                    * 1.5  # Slightly increased delay between companies
+                )
             else:
-                print(f"Warning: No CIK found for ticker {ticker}")
+                # logger already warns about missing CIKs in load_ticker_to_cik_mapping
+                pass
 
-        # Combine all DataFrames into a single one
+        # Combine all Polars DataFrames into a single one
         if all_filings_dfs:
-            combined_df = pd.concat(all_filings_dfs, ignore_index=True)
-            # Add processing date/time as metadata
-            combined_df["processed_date"] = datetime.now()
+            # Use pl.concat for combining Polars DataFrames
+            combined_df = pl.concat(
+                all_filings_dfs, how="vertical_relaxed"
+            )  # Use relaxed to handle potential schema variations slightly
+            # Add processing date/time as metadata using Polars
+            combined_df = combined_df.with_columns(
+                pl.lit(datetime.now()).alias("processed_datetime")
+            )
+            logger.info(
+                f"Combined {len(combined_df)} filings for universe '{universe.name}'."
+            )
             return combined_df
         else:
-            return pd.DataFrame()  # Return empty DataFrame if no filings found
+            logger.warning(
+                f"No filings found for any ticker in universe '{universe.name}'."
+            )
+            return pl.DataFrame()  # Return empty Polars DataFrame if no filings found
 
     def save_filings_to_disk(
         self,
-        filings_df,
-        output_path=None,
+        filings_df: pl.DataFrame,  # Updated input type
+        output_path: Optional[Path] = None,  # Use Path type hint
         file_format="parquet",
         universe_name="universe",
-    ):
+    ) -> Optional[str]:  # Return type remains str path or None
         """
-        Save the filings DataFrame to disk.
+        Save the filings Polars DataFrame to disk.
 
         Args:
-            filings_df: DataFrame containing the filings data
-            output_path: Path where the file should be saved
+            filings_df: Polars DataFrame containing the filings data
+            output_path: Path where the file should be saved (directory or full file path)
             file_format: Format to save the file (parquet or csv)
-            universe_name: Name of the universe (used in filename)
+            universe_name: Name of the universe (used in filename if output_path is dir)
 
         Returns:
-            Path to the saved file
+            Path to the saved file as string, or None if failed/empty
         """
-        if filings_df.empty:
-            print("No filings to save.")
+        if filings_df.is_empty():  # Use Polars is_empty()
+            logger.warning("No filings data to save.")
             return None
 
-        # Set default output directory
+        # Determine output directory and filename
         if output_path is None:
-            output_path = settings.output_dir / "filings"
+            # Default directory based on universe name if possible
+            base_dir = settings.output_dir / "filings" / universe_name
+        elif output_path.is_dir():
+            base_dir = output_path
+        else:  # Assume output_path includes filename
+            base_dir = output_path.parent
+            base_filename = output_path.stem  # Get filename without extension
+            # Override format based on provided path extension if different
+            provided_ext = output_path.suffix.lower().lstrip(".")
+            if (
+                provided_ext in ["parquet", "csv", "delta"]
+                and provided_ext != file_format.lower()
+            ):
+                logger.warning(
+                    f"Output path extension '.{provided_ext}' overrides requested format '{file_format}'. Using '.{provided_ext}'."
+                )
+                file_format = provided_ext
 
-        # Ensure output_path is a Path object for consistent handling
-        from pathlib import Path
+        # Ensure output directory exists
+        base_dir.mkdir(parents=True, exist_ok=True)
 
-        output_path = Path(output_path)
+        # Construct filename if not provided in output_path
+        if output_path is None or output_path.is_dir():
+            # Generate filename, check if it exists as a directory (less likely now)
+            base_filename = f"sec_filings_{universe_name}"
+            # This check might be less necessary if using dedicated dirs, but keep for safety
+            if (base_dir / base_filename).is_dir():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_filename = f"{base_filename}_{timestamp}"
 
-        # Create the directory
-        output_path.mkdir(parents=True, exist_ok=True)
+        # Create full file path with extension
+        file_path = base_dir / f"{base_filename}.{file_format.lower()}"
 
-        # Generate filename, ensuring we don't use a name that's already a directory
-        base_filename = f"sec_filings_{universe_name}"
+        # Save based on format using Polars writers
+        try:
+            if file_format.lower() == "parquet":
+                filings_df.write_parquet(file_path)
+            elif file_format.lower() == "csv":
+                filings_df.write_csv(file_path)
+            elif file_format.lower() == "delta":
+                filings_df.write_delta(file_path)
+            else:
+                logger.error(f"Unsupported file format for saving: {file_format}")
+                return None
 
-        # Check if the intended file path is already a directory
-        if (output_path / base_filename).is_dir():
-            # If it's a directory, add a timestamp to make the filename unique
-            from datetime import datetime
+            logger.info(f"Saved {len(filings_df)} filings to {file_path}")
+            return str(file_path)  # Return path as string
 
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_filename = f"{base_filename}_{timestamp}"
+        except Exception as e:
+            logger.error(
+                f"Error saving filings DataFrame to {file_path}: {e}", exc_info=True
+            )
+            return None
 
-        # Create full file path with filename and extension
-        if file_format.lower() == "parquet":
-            file_path = output_path / f"{base_filename}.parquet"
-        else:
-            file_path = output_path / f"{base_filename}.csv"
-
-        # Convert to string for pandas
-        file_path_str = str(file_path)
-
-        # Ensure the parent directory exists
-        Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-
-        # Save based on format
-        if file_format.lower() == "parquet":
-            filings_df.to_parquet(file_path_str)
-            print(f"Saved {len(filings_df)} filings to {file_path_str}")
-        else:
-            # CSV format
-            filings_df.to_csv(file_path_str, index=False)
-            print(f"Saved {len(filings_df)} filings to {file_path_str}")
-
-        return file_path_str
-
-    def load_filings_from_disk(self, file_path=settings.output_dir / "filings"):
+    def load_filings_from_disk(
+        self, file_path: Union[str, Path]
+    ) -> pl.DataFrame:  # Updated return type and input hint
         """
-        Load filings from a saved file.
+        Load filings from a saved file into a Polars DataFrame.
 
         Args:
-            file_path: Path to the saved filings file
+            file_path: Path (string or Path object) to the saved filings file
 
         Returns:
-            DataFrame containing the filings data
+            Polars DataFrame containing the filings data, or empty DataFrame if error/not found.
         """
-        if not os.path.exists(file_path):
-            print(f"File not found: {file_path}")
-            return pd.DataFrame()
+        file_path_obj = Path(file_path)  # Ensure Path object
 
-        if file_path.endswith(".parquet"):
-            return pd.read_parquet(file_path)
-        elif file_path.endswith(".csv"):
-            return pd.read_csv(file_path)
-        else:
-            print(f"Unsupported file format: {file_path}")
-            return pd.DataFrame()
+        if not file_path_obj.exists():
+            logger.error(f"File not found: {file_path_obj}")
+            return pl.DataFrame()  # Return empty Polars DF
+
+        try:
+            if file_path_obj.suffix.lower() == ".parquet":
+                logger.info(f"Loading Parquet file: {file_path_obj}")
+                return pl.read_parquet(file_path_obj)
+            elif file_path_obj.suffix.lower() == ".csv":
+                logger.info(f"Loading CSV file: {file_path_obj}")
+                # Use infer_schema_length=10000 for better type inference on larger CSVs
+                return pl.read_csv(
+                    file_path_obj, infer_schema_length=10000, try_parse_dates=True
+                )
+            elif file_path_obj.suffix.lower() == ".delta":
+                logger.info(f"Loading Delta file: {file_path}")
+                return pl.read_delta(file_path)
+            else:
+                logger.error(f"Unsupported file format: {file_path_obj.suffix}")
+                return pl.DataFrame()  # Return empty Polars DF
+        except Exception as e:
+            logger.error(f"Error loading file {file_path_obj}: {e}", exc_info=True)
+            return pl.DataFrame()  # Return empty Polars DF
 
     def get_filing_by_accession_number(self, cik, accession_number, file_type="10-K"):
         """
@@ -396,19 +584,30 @@ class EDGARFetcher:
         Returns:
             The text content of the filing
         """
+        # Format CIK with leading zeros to 10 digits
+        cik_formatted = str(cik).zfill(10)
         # Remove dashes from accession number
         acc_no_clean = accession_number.replace("-", "")
 
         # Format the URL to get the full text submission
-        url = f"{self.base_url}edgar/data/{cik}/{acc_no_clean}/{accession_number}.txt"
+        # Check if it's the full submission txt or a specific document
+        # Assuming full submission based on '.txt'
+        # Example: https://www.sec.gov/Archives/edgar/data/320193/000032019323000106/aapl-20230930.htm (primary doc)
+        # Example: https://www.sec.gov/Archives/edgar/data/320193/000032019323000106/0000320193-23-000106.txt (full submission)
+
+        # Let's stick to the full submission text file for now
+        url = f"{self.base_url}Archives/edgar/data/{cik_formatted}/{acc_no_clean}/{accession_number}.txt"
+        logger.debug(f"Fetching full submission text from: {url}")
 
         time.sleep(self.request_interval)  # Respect rate limits
-        response = requests.get(url, headers=self.headers)
-
-        if response.status_code == 200:
+        try:
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
             return response.text
-        else:
-            print(f"Error: {response.status_code} - {response.reason}")
+        except requests.exceptions.RequestException as e:
+            logger.error(
+                f"Error fetching filing text for CIK {cik}, Acc# {accession_number}: {e}"
+            )
             return None
 
     def extract_text_from_filing(self, filing_text):
@@ -423,6 +622,8 @@ class EDGARFetcher:
         Returns:
             The extracted text content (simplified)
         """
+        from bs4 import BeautifulSoup  # Keep import local if only used here
+
         # Split by <DOCUMENT> tags to separate documents
         documents = filing_text.split("<DOCUMENT>")
 
@@ -452,60 +653,62 @@ class EDGARFetcher:
         Returns:
             XbrlInstance object for the filing
         """
-        from xbrl.instance import XbrlParser, XbrlInstance
+        from xbrl.instance import XbrlParser, XbrlInstance  # Keep import local
 
         parser = XbrlParser(self.cache)
         try:
-            schema_url = row["xbrl_root_url"]
+            # Assuming row has 'xbrl_instance_url' or similar key
+            schema_url_key = (
+                "xbrl_instance_url"  # Match name used in search_10k_filings
+            )
+            if schema_url_key not in row or not row[schema_url_key]:
+                logger.warning(
+                    f"Missing or empty XBRL URL key ('{schema_url_key}') in row for ticker {row.get('ticker', 'N/A')}"
+                )
+                return None
+
+            schema_url = row[schema_url_key]
+            logger.debug(f"Parsing XBRL instance from: {schema_url}")
             inst = parser.parse_instance(schema_url)
             return inst
         except Exception as e:
-            print(
-                f"Error parsing XBRL for {row['ticker']} ({row['filing_date']}): {str(e)}"
+            ticker = row.get("ticker", "N/A")
+            filing_date = row.get("filingDate", "N/A")
+            logger.error(
+                f"Error parsing XBRL for {ticker} (Filing Date: {filing_date}): {str(e)}",
+                exc_info=True,
             )
             return None
 
 
-# Example usage
-if __name__ == "__main__":
-    # Replace with your information
-    user_agent = "Your Name (your.email@example.com)"
+# Example usage (commented out, would need update if used)
+# if __name__ == "__main__":
+#     # Replace with your information
+#     user_agent = "Your Name (your.email@example.com)"
 
-    # Apple Inc. CIK
-    apple_cik = "0000320193"
+#     # Apple Inc. CIK
+#     apple_cik = "0000320193"
+#     apple_ticker = "AAPL"
 
-    fetcher = EDGARFetcher(user_agent)
+#     fetcher = EDGARFetcher(user_agent)
 
-    # Example 1: Search for Apple's 10-K filings in a specific year
-    apple_10ks_2020 = fetcher.search_10k_filings(apple_cik, year=2020)
-    print(f"Found {len(apple_10ks_2020)} 10-K filings for Apple Inc. in 2020")
+#     # Example 1: Search for Apple's 10-K filings in a specific year
+#     apple_10ks_2020 = fetcher.search_10k_filings(apple_ticker, apple_cik, year=2020) # Now returns Polars
+#     print(f"Found {len(apple_10ks_2020)} 10-K filings for Apple Inc. in 2020")
+#     if not apple_10ks_2020.is_empty():
+#          print(apple_10ks_2020)
 
-    # Example 2: Search for Apple's 10-K filings in a year range
-    apple_10ks_range = fetcher.search_10k_filings(
-        apple_cik, start_year=2018, end_year=2022
-    )
-    print(
-        f"Found {len(apple_10ks_range)} 10-K filings for Apple Inc. between 2018-2022"
-    )
+#     # Example 2: Search for Apple's 10-K filings in a year range
+#     apple_10ks_range = fetcher.search_10k_filings(
+#         apple_ticker, apple_cik, start_year=2021, end_year=2023 # Updated range
+#     ) # Now returns Polars
+#     print(
+#         f"Found {len(apple_10ks_range)} 10-K filings for Apple Inc. between 2021-2023"
+#     )
+#     if not apple_10ks_range.is_empty():
+#         print(apple_10ks_range)
+#         # Example: Save the range data
+#         # fetcher.save_filings_to_disk(apple_10ks_range, universe_name="AAPL_Test", file_format="parquet")
 
-    # Example 3: Using with a Universe (commented out as it requires additional setup)
-    """
-    from alphaledger.universe import load_universe
-    
-    # Sample CIK mapping (in production this would come from a database or service)
-    ticker_to_cik = {
-        "AAPL": "0000320193",
-        "MSFT": "0000789019",
-        "GOOGL": "0001652044"
-    }
-    
-    # Load universe with time range
-    universe = load_universe("sample_universe", start_year=2020, end_year=2022)
-    
-    # Fetch filings for all tickers in the universe
-    all_filings = fetcher.fetch_filings_for_universe(universe, ticker_to_cik)
-    
-    # Show results
-    for ticker, filings in all_filings.items():
-        print(f"{ticker}: {len(filings)} filings found")
-    """
+#     # Example 3: Using with a Universe requires Universe class update first
+#     # (already done in previous step)

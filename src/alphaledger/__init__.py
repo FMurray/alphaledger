@@ -109,3 +109,36 @@ def build_kb() -> None:
 
     # Call the implementation in the knowledge_base module
     kb_build(log)
+
+
+def patch_cyd_taxonomy():
+    """
+    Add missing CYD taxonomy namespaces to py‑xbrl so that the parser
+    can resolve them automatically.
+    """
+    from xbrl import taxonomy as xbrl_tax
+
+    cyd_base_2024 = "https://xbrl.sec.gov/cyd/2024/"
+    cyd_base_2023 = "https://xbrl.sec.gov/cyd/2023/"
+
+    xbrl_tax.ns_schema_map.update(
+        {
+            # 2024 series
+            "http://xbrl.sec.gov/cyd/2024": f"{cyd_base_2024}cyd-2024.xsd",
+            "http://xbrl.sec.gov/cyd-def/2024": f"{cyd_base_2024}cyd-2024_def.xsd",
+            "http://xbrl.sec.gov/cyd-cal/2024": f"{cyd_base_2024}cyd-2024_cal.xsd",
+            "http://xbrl.sec.gov/cyd-pre/2024": f"{cyd_base_2024}cyd-2024_pre.xsd",
+            "http://xbrl.sec.gov/cyd-lab/2024": f"{cyd_base_2024}cyd-2024_lab.xsd",
+            "http://xbrl.sec.gov/cyd-sub/2024": f"{cyd_base_2024}cyd-sub-2024.xsd",
+            # 2023 series (add only if you process older filings)
+            "http://xbrl.sec.gov/cyd/2023": f"{cyd_base_2023}cyd-2023.xsd",
+            "http://xbrl.sec.gov/cyd-def/2023": f"{cyd_base_2023}cyd-2023_def.xsd",
+            "http://xbrl.sec.gov/cyd-cal/2023": f"{cyd_base_2023}cyd-2023_cal.xsd",
+            "http://xbrl.sec.gov/cyd-pre/2023": f"{cyd_base_2023}cyd-2023_pre.xsd",
+            "http://xbrl.sec.gov/cyd-lab/2023": f"{cyd_base_2023}cyd-2023_lab.xsd",
+            "http://xbrl.sec.gov/cyd-sub/2023": f"{cyd_base_2023}cyd-sub-2023.xsd",
+        }
+    )
+
+
+patch_cyd_taxonomy()

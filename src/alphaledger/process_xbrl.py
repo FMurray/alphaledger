@@ -4,22 +4,77 @@ Module for processing XBRL financial filings.
 
 import re
 import logging
-from typing import Dict, Any, List, Optional, Set, Union
+from typing import Dict, Any, List, Optional, Set, Union, cast
 from enum import Flag, auto, Enum
-from io import StringIO
-import pandas as pd
-from pathlib import Path
-from xbrl.instance import XbrlInstance, AbstractFact
+from xbrl.instance import XbrlInstance, AbstractFact, NumericFact, TextFact
+from xbrl.cache import HttpCache
 from alphaledger.config import settings
 from dataclasses import dataclass
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup, Tag, NavigableString
+import polars as pl
+from pathlib import Path
 
 # Use TYPE_CHECKING to avoid circular import error at runtime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .formatter import DocumentFormatter  # Import for type hinting
+
+# Define the target schema outside the method for clarity and reuse
+TARGET_SCHEMA_POLARS = {
+    "concept_name": pl.Utf8,
+    "concept_namespace": pl.Utf8,
+    "fact_value": pl.Float64,  # Target type after casting
+    "fact_type": pl.Utf8,
+    "section_name": pl.Utf8,
+    "unit": pl.Utf8,  # Added based on _fact_to_row logic
+    "period_instant": pl.Date,  # Added based on _fact_to_row logic
+    "period_start": pl.Date,  # Added based on _fact_to_row logic
+    "period_end": pl.Date,  # Added based on _fact_to_row logic
+    "context_id": pl.Utf8,  # Added based on _fact_to_row logic
+    "context_entity": pl.Utf8,  # Added based on _fact_to_row logic
+    "context_scenario": pl.Utf8,  # Added based on _fact_to_row logic
+    "metadata": pl.Struct(
+        [
+            # Use Int64 for numeric metadata to avoid potential overflow
+            pl.Field("decimals", pl.Int64),
+            pl.Field("precision", pl.Int64),
+        ]
+    ),  # Added based on _fact_to_row logic
+}
+
+# Define common columns first
+COMMON_COLUMNS = {
+    "concept_name": pl.Utf8,
+    "concept_namespace": pl.Utf8,
+    "fact_type": pl.Utf8,  # Keep track of original type
+    "section_name": pl.Utf8,
+    "period_instant": pl.Date,
+    "period_start": pl.Date,
+    "period_end": pl.Date,
+    "context_id": pl.Utf8,
+    "context_entity": pl.Utf8,
+    "context_scenario": pl.Utf8,
+}
+
+TARGET_SCHEMA_NUMERIC_POLARS = {
+    **COMMON_COLUMNS,
+    "fact_value": pl.Float64,
+    "unit": pl.Utf8,
+    "metadata": pl.Struct(
+        [
+            pl.Field("decimals", pl.Int64),
+            pl.Field("precision", pl.Int64),
+        ]
+    ),
+}
+
+TARGET_SCHEMA_TEXT_POLARS = {
+    **COMMON_COLUMNS,
+    "fact_value": pl.Utf8,
+    # Text facts usually don't have units or numeric metadata
+}
 
 
 class ProcessingOptions(Flag):
@@ -69,45 +124,241 @@ class IXBRLDocument:
     sections: List[DocumentSection]
 
     def to_string(self, formatter: "DocumentFormatter") -> str:
+        """Formats the document content into a string using the provided formatter."""
+        return formatter.format_document(self)
+
+    def to_dataframe(
+        self, format: str = "polars", spark_session: Optional[any] = None
+    ) -> Union[pl.DataFrame, any]:
         """
-        Formats the document content into a string using the provided formatter.
+        Converts the document's facts into a structured DataFrame with a guaranteed schema.
 
         Args:
-            formatter: An instance of a DocumentFormatter subclass.
+            format: Either "polars" or "spark" to specify the output format
 
         Returns:
-            A string representation of the document based on the formatter's rules.
+            A DataFrame containing all facts from the document, conforming to TARGET_SCHEMA_POLARS.
         """
-        return formatter.format_document(self)
+        rows = []
+        target_keys = list(TARGET_SCHEMA_POLARS.keys())  # Get keys for _fact_to_row
+        for section in self.sections:
+            for part in section.parts:
+                if part.type == PartType.FACT:
+                    fact = cast(AbstractFact, part.content)
+                    # Pass target keys to ensure consistent dict structure
+                    row = self._fact_to_row(fact, section.title)
+                    rows.append(row)
+
+        if format == "polars":
+            # Create DataFrame directly with the target schema.
+            # This ensures all columns exist from the start, even if rows is empty.
+            # Polars will handle casting from the dictionary values to schema types.
+            # strict=False allows incompatible types (like string -> float error) to become null.
+            try:
+                df = pl.DataFrame(rows, schema=TARGET_SCHEMA_POLARS, strict=False)
+
+                # Optional: Re-cast specific columns if initial cast might be ambiguous
+                # The schema argument should handle this, but being explicit can help debugging.
+                # Example: df = df.with_columns(pl.col("fact_value").cast(pl.Float64, strict=False))
+
+            except Exception as e:
+                # Log error if DataFrame creation fails even with schema
+                logging.error(
+                    f"Failed to create DataFrame with schema, rows may be incompatible: {e}"
+                )
+                # Return an empty DataFrame matching the schema as a fallback
+                df = pl.DataFrame(schema=TARGET_SCHEMA_POLARS)
+
+            return df
+
+        elif format == "spark":
+            if spark_session is None:
+                raise ValueError("spark_session is required for Spark DataFrame output")
+            # Define Spark schema based on TARGET_SCHEMA_POLARS if needed for consistency
+            # ... Spark schema definition ...
+            if not rows:
+                # Return empty Spark DataFrame with schema
+                # return spark_session.createDataFrame([], schema=spark_schema)
+                return spark_session.createDataFrame(rows)  # Let Spark handle empty
+
+            # Create Spark DataFrame (potentially with schema)
+            spark_df = spark_session.createDataFrame(rows)  # , schema=spark_schema)
+            from pyspark.sql import functions as F
+
+            spark_df = spark_df.withColumn(
+                "fact_value", F.col("fact_value").cast("double")
+            )
+            # Ensure other columns match target Spark schema if defined
+            return spark_df
+        else:
+            raise ValueError(f"Unsupported format: {format}")
+
+    def _fact_to_row(self, fact: AbstractFact, section_title: str) -> Dict[str, Any]:
+        """Converts any fact to a dictionary row with common fields."""
+        row_base = {}
+        # Basic Info
+        row_base["concept_name"] = fact.concept.name
+        row_base["concept_namespace"] = fact.concept.schema_url.split("/")[-2]
+        row_base["fact_type"] = type(fact).__name__
+        row_base["section_name"] = section_title
+
+        # Period Info
+        period = getattr(fact, "period", None)
+        if period:
+            row_base["period_instant"] = getattr(period, "instant", None)
+            row_base["period_start"] = getattr(period, "start_date", None)
+            row_base["period_end"] = getattr(period, "end_date", None)
+
+        # Context Info
+        context = getattr(fact, "context", None)
+        if context:
+            row_base["context_id"] = getattr(context, "id", None)
+            entity = getattr(context, "entity", None)
+            row_base["context_entity"] = str(entity) if entity else None
+            scenario = getattr(context, "scenario", None)
+            row_base["context_scenario"] = str(scenario) if scenario else None
+
+        return row_base
+
+    def _numeric_fact_to_row(
+        self, fact: NumericFact, section_title: str
+    ) -> Dict[str, Any]:
+        """Converts a NumericFact to a dictionary row conforming to numeric schema."""
+        # 1. Initialize row with None for all target keys
+        numeric_target_keys = list(TARGET_SCHEMA_NUMERIC_POLARS.keys())
+        row = {key: None for key in numeric_target_keys}
+
+        # 2. Get common fields from base method
+        common_fields = self._fact_to_row(fact, section_title)
+
+        # 3. Update row with common fields (only those present in numeric schema)
+        for key, value in common_fields.items():
+            if key in row:
+                row[key] = value
+
+        # 4. Populate Numeric Specific Fields
+        try:
+            row["fact_value"] = float(fact.value) if fact.value is not None else None
+        except (ValueError, TypeError):
+            row["fact_value"] = None  # Set to null if conversion fails
+
+        unit = getattr(fact, "unit", None)
+        if "unit" in row:
+            row["unit"] = str(unit) if unit else None
+
+        if "metadata" in row:
+            metadata_dict = {"decimals": None, "precision": None}
+            decimals = getattr(fact, "decimals", None)
+            if decimals is not None:
+                try:
+                    metadata_dict["decimals"] = int(decimals)
+                except:
+                    pass
+            precision = getattr(fact, "precision", None)
+            if precision is not None:
+                try:
+                    metadata_dict["precision"] = int(precision)
+                except:
+                    pass
+            row["metadata"] = metadata_dict
+
+        return row
+
+    def _text_fact_to_row(self, fact: TextFact, section_title: str) -> Dict[str, Any]:
+        """Converts a NonNumericFact to a dictionary row conforming to text schema."""
+        # 1. Initialize row with None for all target keys
+        text_target_keys = list(TARGET_SCHEMA_TEXT_POLARS.keys())
+        row = {key: None for key in text_target_keys}
+
+        # 2. Get common fields from base method
+        common_fields = self._fact_to_row(fact, section_title)
+
+        # 3. Update row with common fields (only those present in text schema)
+        for key, value in common_fields.items():
+            if key in row:
+                row[key] = value
+
+        # 4. Populate Text Specific Fields
+        if "fact_value" in row:
+            row["fact_value"] = str(fact.value) if fact.value is not None else None
+
+        return row
+
+    def to_numeric_dataframe(self) -> pl.DataFrame:
+        """Creates a DataFrame of only the NumericFacts."""
+        rows = []
+        # target_keys removed from _numeric_fact_to_row call
+        for section in self.sections:
+            for part in section.parts:
+                if part.type == PartType.FACT and isinstance(part.content, NumericFact):
+                    fact = cast(NumericFact, part.content)
+                    # Call without target_keys
+                    row = self._numeric_fact_to_row(fact, section.title)
+                    rows.append(row)
+
+        # Create with the specific schema
+        try:
+            df = pl.DataFrame(rows, schema=TARGET_SCHEMA_NUMERIC_POLARS, strict=False)
+        except Exception as e:
+            logging.error(f"Failed to create numeric DataFrame: {e}")
+            df = pl.DataFrame(schema=TARGET_SCHEMA_NUMERIC_POLARS)  # Empty fallback
+        return df
+
+    def to_text_dataframe(self) -> pl.DataFrame:
+        """Creates a DataFrame of only the TextFacts."""
+        rows = []
+        # target_keys removed from _text_fact_to_row call
+        for section in self.sections:
+            for part in section.parts:
+                if part.type == PartType.FACT and not isinstance(
+                    part.content, NumericFact
+                ):
+                    fact = cast(TextFact, part.content)
+                    # Call without target_keys
+                    row = self._text_fact_to_row(fact, section.title)
+                    rows.append(row)
+        # Create with the specific schema
+        try:
+            df = pl.DataFrame(rows, schema=TARGET_SCHEMA_TEXT_POLARS, strict=False)
+        except Exception as e:
+            logging.error(f"Failed to create text DataFrame: {e}")
+            df = pl.DataFrame(schema=TARGET_SCHEMA_TEXT_POLARS)  # Empty fallback
+        return df
 
 
 class IXBRLDocumentParser:
-    def __init__(
-        self, instance_path: str, facts: List[AbstractFact], encoding: str = None
-    ):
-        self.instance_path = instance_path
-        self.encoding = encoding
+    def __init__(self, cache: "HttpCache"):
+        self.cache = cache
+        # self.facts_by_id: Dict[str, AbstractFact] = {
+        #     fact.xml_id: fact for fact in facts if fact.xml_id
+        # }
+
+    def parse(self, xbrl_instance: XbrlInstance) -> IXBRLDocument:
+        # Read the HTML/iXBRL file
+        try:
+            instance_path = self.cache.url_to_path(xbrl_instance.instance_url)
+            self.cache
+            if not Path(instance_path).exists():
+                raise FileNotFoundError(
+                    f"Cached file not found at {instance_path} for URL {xbrl_instance.instance_url}"
+                )
+        except Exception as e:
+            logging.error(
+                f"Failed to get cache path for {xbrl_instance.instance_url}: {e}"
+            )
+            return IXBRLDocument(sections=[])
+
+        facts = extract_us_gaap_facts(xbrl_instance)
         self.facts_by_id: Dict[str, AbstractFact] = {
             fact.xml_id: fact for fact in facts if fact.xml_id
         }
-        logging.info(
-            f"Parser Initialized: Received {len(facts)} facts, created lookup for {len(self.facts_by_id)} facts with IDs."
-        )
-        if len(facts) > len(self.facts_by_id):
-            logging.warning(
-                f"{len(facts) - len(self.facts_by_id)} facts were missing an xml_id in the input list."
-            )
-        logging.info(
-            f"First 5 available fact IDs in lookup: {list(self.facts_by_id.keys())[:5]}"
-        )
 
-    def parse(self) -> IXBRLDocument:
-        # Read the HTML/iXBRL file
         try:
-            with open(self.instance_path, "r", encoding=self.encoding) as f:
+            # Assuming default encoding or determine dynamically if needed
+            with open(instance_path, "r", encoding="utf-8") as f:
                 content = f.read()
         except Exception as e:
-            logging.error(f"Failed to read file {self.instance_path}: {e}")
+            logging.error(f"Failed to read cached file {instance_path}: {e}")
             return IXBRLDocument(sections=[])
 
         # Try different parsers to find one that works
@@ -429,7 +680,7 @@ def extract_financial_metrics(
                 metrics_to_extract.extend(detailed_metrics)
 
             # Get all facts from the document using the py-xbrl API
-            facts = xbrl_doc.get_facts()
+            facts = xbrl_doc.facts
 
             # Extract the values for the required metrics
             for metric in metrics_to_extract:
@@ -1056,3 +1307,32 @@ def extract_text_from_html(html_content: str) -> str:
     except Exception as e:
         logging.error(f"Error extracting text from HTML: {str(e)}")
         return html_content  # Return original content if extraction fails
+
+
+def save_facts_to_delta(
+    doc: IXBRLDocument,
+    spark_session,
+    table_name: str,
+    filing_metadata: Dict[str, Any] = None,
+) -> None:
+    """
+    Saves the facts from an IXBRLDocument to a Delta Lake table.
+
+    Args:
+        doc: The IXBRLDocument containing the facts
+        spark_session: The Spark session to use
+        table_name: Name of the Delta table to write to
+        filing_metadata: Optional metadata about the filing (ticker, date, etc.)
+    """
+    from pyspark.sql import functions as F
+
+    # Get facts as Spark DataFrame
+    df = doc.to_dataframe(format="spark")
+
+    # Add filing metadata if provided
+    if filing_metadata:
+        for key, value in filing_metadata.items():
+            df = df.withColumn(key, F.lit(value))
+
+    # Write to Delta table
+    df.write.format("delta").mode("append").saveAsTable(table_name)
