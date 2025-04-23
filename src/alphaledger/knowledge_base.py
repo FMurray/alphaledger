@@ -1,10 +1,10 @@
 import os
 import json
-from datetime import datetime
+from datetime import datetime, date
 from typing import Dict, List, Optional, Any, Union, Literal
 import logging
 from pathlib import Path
-import pandas as pd
+import polars as pl
 import numpy as np
 import lancedb
 from lancedb.table import Table
@@ -21,6 +21,15 @@ from rich.progress import (
 from alphaledger.universe import load_universe, Universe
 from alphaledger.sec import EDGARFetcher, load_ticker_to_cik_mapping
 from alphaledger.config import settings
+
+# Import necessary components
+from alphaledger.formatter import MarkdownFormatter
+from alphaledger.process_xbrl import (
+    process_filing_content,
+    ProcessingOptions,
+    generate_placeholder_data,
+    IXBRLDocument,
+)
 
 # Default embedding dimension for OpenAI text-embedding models
 DEFAULT_EMBEDDING_DIM = 3072
@@ -254,7 +263,7 @@ class KnowledgeBase:
             return
 
         # Prepare the documents for insertion
-        df_docs = []
+        prepared_docs = []
         for doc in documents:
             # Generate embedding if not provided
             if "vector" not in doc:
@@ -266,14 +275,38 @@ class KnowledgeBase:
             if "source" not in doc:
                 doc["source"] = "unknown"
 
-            df_docs.append(doc)
+            prepared_docs.append(doc)
 
-        # Convert to dataframe and add to table
-        df = pd.DataFrame(df_docs)
-        self.table.add(df)
+        # Convert list of dicts to Polars DataFrame and add to table
+        # LanceDB handles PyArrow schema conversion
+        try:
+            df = pl.DataFrame(prepared_docs)
+            self.table.add(df)
 
-        # Create index after adding data if it doesn't exist yet
-        self._ensure_index_exists()
+            # Create index after adding data if it doesn't exist yet
+            self._ensure_index_exists()
+        except pa.ArrowInvalid as e:
+            # Log detailed error if schema mismatch occurs
+            logging.error(f"Arrow schema validation failed when adding documents: {e}")
+            logging.error(f"Schema expected by table: {self.table.schema}")
+            if prepared_docs:
+                # Attempt to infer schema from data and log it
+                try:
+                    inferred_schema = pl.DataFrame(prepared_docs[:5]).schema
+                    logging.error(
+                        f"Inferred schema from first 5 documents: {inferred_schema}"
+                    )
+                except Exception as ie:
+                    logging.error(
+                        f"Could not infer schema from prepared documents: {ie}"
+                    )
+            # Depending on requirements, you might want to raise the error
+            # or try to fix the data before adding again.
+            # For now, we just log the error.
+            print(f"ERROR: Failed to add documents due to schema mismatch. Check logs.")
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during add_documents: {e}")
+            print(f"ERROR: Failed to add documents. Check logs.")
 
     def search(
         self,
@@ -289,40 +322,56 @@ class KnowledgeBase:
             query: The search query
             ticker: Optional ticker to filter results
             limit: Maximum number of results to return
-            min_score: Minimum similarity score (0-1)
+            min_score: Minimum similarity score (0-1) - Note: uses distance currently
 
         Returns:
-            A list of matching documents with similarity scores
+            A list of matching documents with similarity scores (_distance)
         """
         # Generate embedding for the query
         query_embedding = self.generate_embedding(query)
+        query_embedding_np = np.array(query_embedding)  # For potential numpy ops later
 
         # Build the search query
-        search_query = self.table.search(query_embedding)
+        search_query = self.table.search(query_embedding_np)
 
         # Filter by ticker if provided
         if ticker:
             search_query = search_query.where(f"ticker = '{ticker}'")
 
-        # Execute the search
-        results = search_query.limit(limit).to_pandas()
+        # Execute the search and get results as list of dicts
+        # LanceDB returns results including a _distance field
+        results_arrow = search_query.limit(limit).to_arrow()
+        results = results_arrow.to_pylist()  # Convert Arrow table to list of dicts
 
-        # Convert to list of dictionaries and add similarity score
+        # Filter based on score (derived from distance) and clean up
         docs = []
-        for _, row in results.iterrows():
-            doc = row.to_dict()
-            # Calculate cosine similarity score (0-1)
-            score = float(
-                np.dot(query_embedding, doc["vector"])
-                / (np.linalg.norm(query_embedding) * np.linalg.norm(doc["vector"]))
-            )
+        for doc in results:
+            # Distance is returned by LanceDB. Lower distance = higher similarity.
+            # Exact conversion depends on the metric ('l2', 'cosine', 'dot')
+            distance = doc["_distance"]
 
-            # Skip if below minimum score
-            if score < min_score:
+            # Example score calculation (adjust based on metric)
+            # For L2: score = 1 / (1 + distance)
+            # For Cosine: score = 1 - distance (since lancedb returns 1 - cosine_sim)
+            # For Dot: score might need normalization or use distance directly
+            score = -1  # Placeholder - use distance directly or calculate score
+            if self.index_metric == "cosine":
+                # LanceDB cosine distance = 1 - cosine similarity
+                score = 1.0 - distance
+            elif self.index_metric == "l2":
+                # Inverse relationship: smaller distance is better
+                # Simple inversion, may need adjustment based on expected range
+                score = 1.0 / (1.0 + distance)
+            else:  # dot or other - just use negative distance (higher dot is better)
+                score = distance  # Or potentially np.dot if vector included
+
+            # Skip if below minimum score threshold (if score is similarity-based)
+            # If using distance directly, the condition might need reversal (e.g., distance > max_distance)
+            if self.index_metric in ["cosine", "l2"] and score < min_score:
                 continue
 
             # Clean up the result
-            doc["score"] = score
+            doc["score"] = score  # Add calculated score or use distance
             doc.pop("vector", None)  # Remove the embedding from the result
             docs.append(doc)
 
@@ -618,7 +667,7 @@ def build_kb(
     logger: Optional[logging.Logger] = None, filings_file: Optional[str] = None
 ) -> KnowledgeBase:
     """
-    Build the knowledge base from a specified universe.
+    Build the knowledge base from a specified universe using markdown formatting and chunking.
 
     Args:
         logger: Logger instance
@@ -637,8 +686,17 @@ def build_kb(
         # Set LanceDB logs to WARNING to reduce output noise
         logging_level = logging.WARNING
 
+    # Ensure logger exists if needed
+    if settings.verbose and not logger:
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger("alphaledger.kb_build")
+
     lancedb_logger = logging.getLogger("lancedb")
     lancedb_logger.setLevel(logging_level)
+
+    # Define chunking parameters (consider making these configurable in settings)
+    CHUNK_SIZE = 1000
+    CHUNK_OVERLAP = 100
 
     # Continue with the same Rich progress implementation as before
     with Progress(
@@ -648,7 +706,6 @@ def build_kb(
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TimeElapsedColumn(),
     ) as progress:
-        # Main task for overall progress
         main_task = progress.add_task("[bold green]Building knowledge base...", total=5)
 
         # Load the universe with specified time period
@@ -664,6 +721,7 @@ def build_kb(
         kb = KnowledgeBase(
             uri=settings.kb_uri,
             embedding_model=settings.embedding_model,
+            embedding_dim=settings.embedding_dim,  # Pass embedding dim
             index_metric=settings.kb_index_metric,
             index_type=settings.kb_index_type,
             index_num_partitions=settings.kb_index_num_partitions,
@@ -673,23 +731,49 @@ def build_kb(
         )
         progress.update(kb_task, advance=1)
 
-        # Process filings - load from parquet file if provided
-        filings_task = progress.add_task("[cyan]Processing filings data...", total=1)
+        # Load or Fetch Filings Data
+        filings_load_task = progress.add_task(
+            "[cyan]Loading/Fetching filings data...", total=1
+        )
 
         # Initialize SEC fetcher
         sec_fetcher = EDGARFetcher(settings.sec_user_agent)
+        # Construct the expected path for the filings Delta Lake table
+        filings_delta_path = (
+            settings.output_dir / f"sec_filings_{settings.universe_name}.delta"
+        )
 
-        if filings_file and os.path.exists(filings_file):
-            progress.console.print(f"[yellow]Loading filings data from {filings_file}")
-            filings_df = pd.read_parquet(filings_file)
+        # If a specific file is passed, use it, otherwise use the constructed path
+        target_filings_path = filings_file if filings_file else str(filings_delta_path)
+
+        if os.path.exists(target_filings_path):
             progress.console.print(
-                f"[green]Loaded {len(filings_df)} filings for {filings_df['ticker'].nunique()} companies"
+                f"[yellow]Loading filings data from {target_filings_path}..."
             )
+            try:
+                filings_df = sec_fetcher.load_filings_from_disk(target_filings_path)
+                progress.console.print(
+                    f"[green]Loaded {len(filings_df)} filings for {filings_df['ticker'].n_unique()} companies"
+                )
+                logging.info(f"Filings DataFrame: {filings_df}")
+            except Exception as e:
+                progress.console.print(
+                    f"[red]Error loading filings from {target_filings_path}: {e}"
+                )
+                progress.console.print("[yellow]Attempting to fetch filings instead...")
+                # filings_df = pd.DataFrame()  # Ensure filings_df is initialized - Use None or empty Polars DF
+                filings_df = None  # Set to None, fetch block will handle creation
         else:
             progress.console.print(
-                "[yellow]No filings file found. Fetching filings for universe..."
+                f"[yellow]Filings file not found at {target_filings_path}. Will fetch."
             )
+            # filings_df = pd.DataFrame()  # Initialize filings_df - Use None
+            filings_df = None  # Set to None initially
 
+        return
+
+        # If filings_df is None (either not found or failed to load), fetch them
+        if filings_df is None:
             # Load ticker to CIK mapping
             cache_file = settings.output_dir / "ticker_to_cik.json"
             ticker_to_cik = load_ticker_to_cik_mapping(
@@ -699,153 +783,338 @@ def build_kb(
             # Fetch filings for universe
             filings_df = sec_fetcher.fetch_filings_for_universe(universe, ticker_to_cik)
 
-            # Save filings to disk
-            filings_dir = settings.output_dir / "filings"
-            os.makedirs(filings_dir, exist_ok=True)
-            filings_file = sec_fetcher.save_filings_to_disk(
-                filings_df,
-                output_path=filings_dir,
-                file_format="parquet",
-                universe_name=settings.universe_name,
-            )
+            # Save filings metadata to disk (Delta)
+            os.makedirs(settings.output_dir, exist_ok=True)  # Ensure output dir exists
+            try:
+                saved_path = sec_fetcher.save_filings_to_disk(
+                    filings_df,
+                    output_path=settings.output_dir,  # Save directly in output_dir
+                    file_format="delta",
+                    universe_name=settings.universe_name,
+                )
+                progress.console.print(
+                    f"[green]Fetched and saved metadata for {len(filings_df)} filings for {filings_df['ticker'].n_unique()} companies to {saved_path}"
+                )
+                # Update target_filings_path in case we need it later (though loading already failed/skipped)
+                target_filings_path = saved_path
+            except Exception as e:
+                progress.console.print(
+                    f"[red]Error saving fetched filings to Delta Lake: {e}"
+                )
+                # Proceed without saved metadata if saving fails
 
-            progress.console.print(
-                f"[green]Fetched and saved {len(filings_df)} filings for {filings_df['ticker'].nunique()} companies"
-            )
+            # Download actual filing content (assuming metadata fetch was successful)
+            if not filings_df.is_empty():
+                download_task = progress.add_task(
+                    "[cyan]Downloading filing contents...", total=len(filings_df)
+                )
+                # Convert DataFrame to the dictionary format expected by process_filing_contents
+                # Group by ticker first
+                filings_by_ticker = (
+                    filings_df.groupby("ticker")
+                    .apply(lambda x: x.to_dict("records"))
+                    .to_dict()
+                )
 
-        progress.update(filings_task, advance=1)
+                # Use the existing function to download/save raw and text versions
+                filings_content_dir = (
+                    settings.output_dir / "filings"
+                )  # Separate dir for content
+                processed_count = process_filing_contents(
+                    sec_fetcher,
+                    filings_by_ticker,  # Pass the dict format expected
+                    filings_content_dir,  # Save content to specific subdir
+                    settings.verbose,
+                    logger,
+                )
+                progress.update(
+                    download_task, completed=len(filings_df)
+                )  # Mark as complete
+                progress.console.print(
+                    f"[green]Downloaded content for {processed_count} filings to {filings_content_dir}."
+                )
+            else:
+                progress.console.print(
+                    "[yellow]No filings metadata fetched, skipping content download."
+                )
+
+        progress.update(filings_load_task, advance=1)
         progress.update(main_task, advance=1)
 
-        # # Download and process actual filing content if depth > 1
-        # if settings.kb_depth > 1 and not filings_df.empty:
-        #     processing_task = progress.add_task(
-        #         "[cyan]Processing filing contents...", total=1
-        #     )
-        #     processed = process_filing_contents_from_df(
-        #         sec_fetcher, filings_df, settings.output_dir, settings.verbose, logger
-        #     )
-        #     progress.console.print(
-        #         f"[green]Downloaded and processed {processed} filing documents"
-        #     )
-        #     progress.update(processing_task, advance=1)
+        # Build the knowledge base from the filings
+        kb_build_task = progress.add_task(
+            "[cyan]Processing filings and adding to knowledge base...",
+            total=len(universe.get_tickers()),
+        )
 
-        # progress.update(main_task, advance=1)
+        document_count = 0
+        total_chunks_added = 0
 
-        # # Temporarily replace the _ensure_index_exists method to prevent index creation
-        # original_ensure_index = kb._ensure_index_exists
-        # kb._ensure_index_exists = lambda: None  # Do nothing
+        # Determine Processing Options based on settings
+        options = ProcessingOptions.NONE
+        if settings.kb_depth == 1:
+            options = ProcessingOptions.LEVEL_1
+        elif settings.kb_depth == 2:
+            options = ProcessingOptions.LEVEL_2
+        else:  # depth 3 or higher
+            options = ProcessingOptions.LEVEL_3
 
-        # # Build the knowledge base from the filings
-        # kb_build_task = progress.add_task(
-        #     "[cyan]Adding documents to knowledge base...",
-        #     total=len(universe.get_tickers()),
-        # )
+        # Instantiate the formatter once
+        formatter = MarkdownFormatter(options=options)
 
-        # document_count = 0
+        # Process each security in the universe
+        for ticker in universe.get_tickers():
+            security = universe.get_security(ticker)
+            if settings.verbose:
+                progress.console.print(f"[blue]Processing {ticker} ({security.name})")
 
-        # # Collect information for each security - modified to track progress
-        # for ticker in universe.get_tickers():
-        #     security = universe.get_security(ticker)
+            # Filter the main Polars DataFrame for this ticker's filings
+            ticker_filings_df = None
+            if filings_df is not None and not filings_df.is_empty():
+                try:
+                    ticker_filings_df = filings_df.filter(pl.col("ticker") == ticker)
+                except Exception as filter_err:
+                    if settings.verbose:
+                        progress.console.print(
+                            f"[red]Error filtering filings for {ticker}: {filter_err}"
+                        )
+                    ticker_filings_df = None  # Ensure it remains None on error
 
-        #     progress.console.print(f"[blue]Processing {ticker} ({security.name})")
+            if ticker_filings_df is None or ticker_filings_df.is_empty():
+                if settings.verbose:
+                    progress.console.print(
+                        f"[yellow]No filings metadata found for {ticker}. Skipping."
+                    )
+                progress.update(kb_build_task, advance=1)
+                continue
 
-        #     # Add basic company information
-        #     kb.add_document(
-        #         {
-        #             "ticker": ticker,
-        #             "text": f"Company overview: {security.name} operates in the {security.sector} sector.",
-        #             "source": "company_profile",
-        #             "date": f"{settings.end_year}-01-01",
-        #             "section": "overview",
-        #         }
-        #     )
-        #     document_count += 1
+            filing_count = len(ticker_filings_df)
+            if filing_count > 0:
+                if settings.verbose:
+                    progress.console.print(
+                        f"[dim]Found {filing_count} filings for {ticker}"
+                    )
 
-        #     # Process SEC filings if available - updated for DataFrame
-        #     ticker_filings = (
-        #         filings_df[filings_df["ticker"] == ticker]
-        #         if not filings_df.empty
-        #         else pd.DataFrame()
-        #     )
+                for filing_dict in ticker_filings_df.iter_rows(named=True):
+                    filing_date = filing_dict.get("filingDate")  # Key from Polars DF
+                    filing_type = filing_dict.get("form", "10-K")
+                    accession_number = filing_dict.get("accessionNumber", "")
+                    if not accession_number:
+                        accession_number = filing_dict.get("accession_number", "")
+                    documents_url = filing_dict.get("documents_url", "")
 
-        #     filing_count = len(ticker_filings)
-        #     if filing_count > 0:
-        #         progress.console.print(
-        #             f"[dim]Found {filing_count} filings for {ticker}"
-        #         )
+                    # --- Normalize and validate filing date early so it can be reused down‑stream ---
+                    try:
+                        if isinstance(filing_date, (datetime, date)):
+                            filing_date_str = filing_date.strftime("%Y-%m-%d")
+                        else:
+                            filing_date_str = str(filing_date)
 
-        #         for _, filing in ticker_filings.iterrows():
-        #             filing_date = filing["filing_date"]
-        #             if isinstance(filing_date, pd.Timestamp):
-        #                 filing_date = filing_date.strftime("%Y-%m-%d")
-        #                 filing_year = filing_date.split("-")[0]
-        #             else:
-        #                 filing_year = str(filing_date).split("-")[0]
+                        # Basic YYYY‑MM‑DD check
+                        if not (
+                            len(filing_date_str) == 10
+                            and filing_date_str[4] == "-"
+                            and filing_date_str[7] == "-"
+                        ):
+                            raise ValueError("Date string not in YYYY-MM-DD format")
 
-        #             filing_year = int(filing_year)
+                        filing_year = int(filing_date_str.split("-")[0])
+                    except (ValueError, TypeError, AttributeError) as date_err:
+                        if settings.verbose:
+                            progress.console.print(
+                                f"[yellow]Skipping filing for {ticker} {accession_number} due to invalid/unparseable date '{filing_date}': {date_err}"
+                            )
+                        continue
 
-        #             # Skip filings outside the specified year range
-        #             if (
-        #                 filing_year < settings.start_year
-        #                 or filing_year > settings.end_year
-        #             ):
-        #                 continue
+                    # Skip filings outside the specified year range
+                    if (
+                        filing_year < settings.start_year
+                        or filing_year > settings.end_year
+                    ):
+                        continue
 
-        #             # Get filing details from DataFrame columns
-        #             filing_type = "10-K"  # Our fetcher currently only gets 10-Ks
-        #             accession_number = filing.get("accessionNumber", "")
-        #             documents_url = filing.get("documents_url", "")
+                    # Attempt to use a pre-generated iXBRL instance URL first (preferred path)
+                    xbrl_instance_url = filing_dict.get("xbrl_instance_url", "")
 
-        #             # Fetch and process the filing content
-        #             filing_chunks = fetch_and_process_filing(
-        #                 ticker=ticker,
-        #                 filing_type=filing_type,
-        #                 filing_date=filing_date,
-        #                 accession_number=accession_number,
-        #                 documents_url=documents_url,
-        #                 output_dir=settings.output_dir,
-        #                 depth=settings.kb_depth,
-        #                 verbose=settings.verbose,
-        #                 logger=logger,
-        #             )
+                    processed_document: Optional[IXBRLDocument] = (
+                        None  # Reset for each filing
+                    )
+                    markdown_content = ""
+                    error_occurred = False
 
-        #             # Add the processed chunks to the knowledge base
-        #             for chunk in filing_chunks:
-        #                 kb.add_document(
-        #                     {
-        #                         "ticker": ticker,
-        #                         "text": chunk["text"],
-        #                         "source": f"{filing_type}_{accession_number}",
-        #                         "date": filing_date,
-        #                         "section": chunk.get("section", "unknown"),
-        #                     }
-        #                 )
-        #                 document_count += 1
-        #     else:
-        #         progress.console.print(f"[yellow]No filings found for {ticker}")
+                    if xbrl_instance_url:
+                        if settings.verbose:
+                            progress.console.print(
+                                f"[dim]  Parsing iXBRL instance for {ticker} {accession_number}..."
+                            )
+                        try:
+                            # Lazy import heavy deps
+                            from xbrl.cache import HttpCache  # type: ignore
+                            from xbrl.instance import XbrlParser  # type: ignore
+                            from alphaledger.process_xbrl import IXBRLDocumentParser
 
-        #     # Update progress for this ticker
-        #     progress.update(kb_build_task, advance=1)
+                            cache_dir = settings.output_dir / "cache"
+                            cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # progress.update(main_task, advance=1)
+                            http_cache = HttpCache(str(cache_dir))
+                            http_cache.set_headers(
+                                {"User-Agent": settings.sec_user_agent}
+                            )
 
-        # # Create index once after all documents are added (if we're not using KNN)
-        # indexing_task = progress.add_task("[cyan]Building vector index...", total=1)
-        # if kb.index_type in ["KNN", "FLAT"]:
-        #     progress.console.print(
-        #         f"[green]Using exhaustive kNN search for {document_count} documents - no index needed"
-        #     )
-        # else:
-        #     progress.console.print(
-        #         f"[yellow]Creating vector index for {document_count} documents - this may take some time..."
-        #     )
-        #     # Restore original method and create index
-        #     kb._ensure_index_exists = original_ensure_index
-        #     kb._ensure_index_exists()
+                            x_parser = XbrlParser(http_cache)
+                            xbrl_inst = x_parser.parse_instance(xbrl_instance_url)
 
-        # progress.update(indexing_task, advance=1)
-        # progress.update(main_task, advance=1)
-        # progress.console.print("[bold green]Knowledge base built successfully!")
+                            doc_parser = IXBRLDocumentParser(http_cache)
+                            processed_document = doc_parser.parse(xbrl_inst)
+
+                            if processed_document and processed_document.sections:
+                                markdown_content = formatter.format_document(
+                                    processed_document
+                                )
+                            else:
+                                if settings.verbose:
+                                    progress.console.print(
+                                        f"[yellow]Parsed iXBRL for {ticker} {accession_number} but got empty document sections."
+                                    )
+                        except Exception as ix_err:
+                            if settings.verbose:
+                                progress.console.print(
+                                    f"[yellow]IXBRL parsing failed for {ticker} {accession_number}: {ix_err}"
+                                )
+                            # Fall through to other processing paths
+
+                    if not accession_number:
+                        if settings.verbose:
+                            progress.console.print(
+                                f"[yellow]Skipping filing for {ticker} {filing_date} due to missing accession number."
+                            )
+                        continue
+
+                    # --- Start Processing Filing Content (fallback to local/raw path if IXBRL not parsed) ---
+                    # Use the dedicated content directory
+                    filings_content_dir = settings.output_dir / "filings"
+                    ticker_filings_dir = filings_content_dir / ticker
+                    year_str = str(filing_year)
+                    text_file_path = (
+                        ticker_filings_dir
+                        / f"{ticker}_{filing_type}_{year_str}_text.txt"
+                    )
+                    raw_file_path = (
+                        ticker_filings_dir / f"{ticker}_{filing_type}_{year_str}.txt"
+                    )
+
+                    # If markdown_content already obtained from IXBRL parsing, skip other heavy processing
+                    if markdown_content:
+                        pass  # Already have content
+                    else:
+                        processed_document = None  # Reset for local parsing path
+                        error_occurred = False
+                        # (existing local file / fetch logic remains unchanged below)
+
+                    # --- Chunking and Embedding ---
+                    chunks = []
+                    if markdown_content:
+                        start = 0
+                        while start < len(markdown_content):
+                            end = start + CHUNK_SIZE
+                            chunks.append(markdown_content[start:end])
+                            start += CHUNK_SIZE - CHUNK_OVERLAP
+
+                    if chunks:
+                        chunk_docs = []
+                        for i, chunk_text in enumerate(chunks):
+                            try:
+                                embedding = kb.generate_embedding(chunk_text)
+                                doc = {
+                                    "ticker": ticker,
+                                    "text": chunk_text,
+                                    "vector": embedding,
+                                    "source": f"{filing_type}_{accession_number}",
+                                    "date": filing_date_str,
+                                    "section": f"chunk_{i + 1}",  # Basic section label
+                                }
+                                chunk_docs.append(doc)
+                            except Exception as e:
+                                if settings.verbose:
+                                    progress.console.print(
+                                        f"[red]Error generating embedding for chunk {i + 1} of {ticker} {accession_number}: {e}"
+                                    )
+
+                        if chunk_docs:
+                            try:
+                                kb.add_documents(chunk_docs)
+                                total_chunks_added += len(chunk_docs)
+                                document_count += len(
+                                    chunk_docs
+                                )  # Track total docs/chunks added
+                            except Exception as e:
+                                if settings.verbose:
+                                    progress.console.print(
+                                        f"[red]Error adding chunks to LanceDB for {ticker} {accession_number}: {e}"
+                                    )
+                    elif error_occurred:
+                        # Add the error message as a single document if processing failed
+                        try:
+                            embedding = kb.generate_embedding(markdown_content)
+                            doc = {
+                                "ticker": ticker,
+                                "text": markdown_content,
+                                "vector": embedding,
+                                "source": f"{filing_type}_{accession_number}",
+                                "date": filing_date_str,
+                                "section": "processing_error",
+                            }
+                            kb.add_document(
+                                doc
+                            )  # Use add_document for single error entry
+                            document_count += 1
+                        except Exception as e:
+                            if settings.verbose:
+                                progress.console.print(
+                                    f"[red]Error adding error document to LanceDB for {ticker} {accession_number}: {e}"
+                                )
+
+            else:  # No filings found for ticker
+                if settings.verbose:
+                    progress.console.print(
+                        f"[yellow]No filings found for {ticker} within date range."
+                    )
+
+            # Update progress for this ticker
+            progress.update(kb_build_task, advance=1)
+
+        progress.update(main_task, advance=1)  # Finished processing all tickers
+
+        # Create index once after all documents are added
+        indexing_task = progress.add_task("[cyan]Building vector index...", total=1)
+        if document_count > 0:  # Only index if documents were added
+            if kb.index_type in [
+                "KNN",
+                "FLAT",
+            ]:  # LanceDB uses 'FLAT' not 'KNN' for exact search
+                progress.console.print(
+                    f"[green]Using exhaustive kNN ({kb.index_type}) search for {document_count} documents - no index needed"
+                )
+            else:
+                progress.console.print(
+                    f"[yellow]Creating vector index ({kb.index_type}) for {document_count} documents ({total_chunks_added} chunks) - this may take some time..."
+                )
+                try:
+                    kb._ensure_index_exists()  # Create the index
+                except Exception as e:
+                    progress.console.print(f"[red]Failed to create index: {e}")
+                    if logger:
+                        logger.error(f"Index creation failed: {e}", exc_info=True)
+        else:
+            progress.console.print(
+                "[yellow]No documents were added to the knowledge base. Skipping index creation."
+            )
+
+        progress.update(indexing_task, advance=1)
+        progress.update(main_task, advance=1)
+        progress.console.print(
+            f"[bold green]Knowledge base build process completed! Added {total_chunks_added} chunks."
+        )
 
     return kb
 
@@ -870,6 +1139,7 @@ def query_knowledge_base(query: str, ticker: str = None, limit: int = 5):
     kb = KnowledgeBase(
         uri=settings.kb_uri,
         embedding_model=settings.embedding_model,
+        embedding_dim=settings.embedding_dim,  # Pass dim
         index_metric=settings.kb_index_metric,
         index_type=settings.kb_index_type,
         index_num_partitions=settings.kb_index_num_partitions,

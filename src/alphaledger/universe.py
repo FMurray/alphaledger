@@ -7,6 +7,7 @@ import os
 from alphaledger.config import settings
 import datetime
 import polars as pl
+import re
 
 from alphaledger.sec import EDGARFetcher, load_ticker_to_cik_mapping
 from alphaledger import get_logger
@@ -42,15 +43,25 @@ class Universe:
     def __init__(
         self,
         name: str = "Default Universe",
-        start_year: Optional[int] = None,
-        end_year: Optional[int] = None,
     ):
-        self.name = name
+        # Preserve the original name to support hierarchical paths like "sectors/cloud_computing"
+        self.raw_name = name
+        self.name = self._normalize_name(name)
         self.securities: Dict[str, Security] = {}
-        self.start_year = start_year
-        self.end_year = end_year
+        self.start_year = settings.start_year
+        self.end_year = settings.end_year
         self.filings_df: Optional[pl.DataFrame] = None
         self._fetcher: Optional[EDGARFetcher] = None
+
+    def _normalize_name(self, name: str) -> str:
+        """Normalize the universe name into a filesystem‑safe string.
+
+        Replaces slashes with underscores and converts any character that is
+        *not* alphanumeric, hyphen or underscore into an underscore as well
+        (e.g. spaces → "_", "%" → "_", etc.).
+        """
+        name = name.replace("/", "_")
+        return re.sub(r"[^A-Za-z0-9_-]", "_", name)
 
     def _get_fetcher(self) -> EDGARFetcher:
         """Initializes or returns the EDGARFetcher instance."""
@@ -58,17 +69,28 @@ class Universe:
             self._fetcher = EDGARFetcher()
         return self._fetcher
 
-    def _get_filings_path(self, file_format="parquet") -> Path:
+    def _get_filings_path(self, file_format="delta") -> Path:
         """Determines the standard path for saving/loading filings for this universe."""
-        filings_dir = settings.output_dir / "filings" / self.name
-        filings_dir.mkdir(parents=True, exist_ok=True)
-        return filings_dir / f"sec_filings.{file_format}"
+        output_dir = settings.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # If the *raw* universe name contains a "/" treat the part before the
+        # first slash as a sub‑folder to group related universes (e.g.
+        # "sectors/cloud_computing" →  output/sec_filings_sectors/cloud_computing.delta)
+        if "/" in self.raw_name:
+            dir_prefix, file_part = self.raw_name.split("/", 1)
+            dir_path = output_dir / f"sec_filings_{dir_prefix}"
+            dir_path.mkdir(parents=True, exist_ok=True)
+            return dir_path / f"{self._normalize_name(file_part)}.{file_format}"
+
+        # Fallback: flat naming (previous behaviour)
+        return output_dir / f"sec_filings_{self.name}.{file_format}"
 
     def fetch_or_load_filings(
         self,
         force_fetch: bool = False,
         max_age_days: int = 7,
-        file_format="parquet",
+        file_format="delta",  # Default to delta
     ) -> None:
         """
         Fetches SEC 10-K filings for the universe or loads them from disk if recent.
@@ -146,7 +168,7 @@ class Universe:
                     )
                     saved_path = fetcher.save_filings_to_disk(
                         fetched_df,
-                        output_path=filings_path.parent,
+                        output_path=settings.output_dir,  # Save directly to output_dir
                         file_format=file_format,
                         universe_name=self.name,
                     )
@@ -227,6 +249,234 @@ class Universe:
         )
         return f"{self.name}{time_range} ({len(self)} securities) {filings_status}"
 
+    def get_missing_filings(self) -> List[Dict[str, int]]:
+        """Return missing (ticker, year) combinations.
+
+        We expect exactly one 10‑K filing per (ticker, filing_year) within the
+        universe's defined year range.  After `fetch_or_load_filings` has
+        populated ``self.filings_df``, this helper inspects that DataFrame and
+        returns a list of dictionaries like ``{"ticker": "AMZN", "filing_year":
+        2021}`` for every combination that is absent.
+        """
+        # Ensure filings metadata is loaded
+        if self.filings_df is None:
+            logger.info(
+                "Filings not yet loaded – attempting to load via fetch_or_load_filings()."
+            )
+            # Avoid infinite recursion if fetch_or_load_filings fails
+            # Just return potentially missing based on current state or tickers/years
+            if self.filings_df is None:  # Check again after potential load attempt
+                self.fetch_or_load_filings()
+
+        # If still empty or None after attempt, assume everything is missing
+        if self.filings_df is None or self.filings_df.is_empty():
+            logger.warning(
+                "Filings DataFrame is empty or None, reporting all expected combinations as missing."
+            )
+            missing = [
+                {"ticker": t, "filing_year": y}
+                for t in self.get_tickers()
+                for y in self.get_filing_years()
+            ]
+            return missing
+
+        # Build a fast‑lookup set of existing (ticker, year) tuples
+        # Ensure 'ticker' and 'filing_year' columns exist
+        if (
+            "ticker" not in self.filings_df.columns
+            or "filing_year" not in self.filings_df.columns
+        ):
+            logger.warning(
+                "filings_df is missing 'ticker' or 'filing_year' column – treating every combination as missing."
+            )
+            existing_pairs = set()
+        else:
+            try:
+                # Filter out potential nulls before creating pairs
+                filtered_df = self.filings_df.filter(
+                    pl.col("ticker").is_not_null() & pl.col("filing_year").is_not_null()
+                )
+                existing_pairs = set(
+                    zip(
+                        filtered_df["ticker"].to_list(),
+                        filtered_df["filing_year"].to_list(),
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error creating existing pairs set: {e}. Reporting all as missing.",
+                    exc_info=True,
+                )
+                existing_pairs = set()
+
+        missing: List[Dict[str, int]] = []
+        for ticker in self.get_tickers():
+            for yr in self.get_filing_years():
+                if (ticker, yr) not in existing_pairs:
+                    missing.append({"ticker": ticker, "filing_year": yr})
+        return missing
+
+    def sync_filings(self, file_format="delta") -> None:
+        """
+        Ensures the local filings data matches the expected filings for the universe.
+
+        Loads existing data, identifies missing (ticker, year) combinations,
+        fetches only the missing filings, and updates the local data file.
+
+        Args:
+            file_format: The format of the filings file ('delta', 'parquet', 'csv').
+        """
+        logger.info(f"Starting filings sync for universe '{self.name}'...")
+
+        # 1. Ensure base data is loaded (using existing logic)
+        # Use a low max_age_days to ensure we load relatively fresh data before syncing
+        # Force fetch=False allows using existing file even if old, sync will fill gaps.
+        self.fetch_or_load_filings(
+            force_fetch=False, max_age_days=3650, file_format=file_format
+        )
+
+        # Handle case where fetch/load failed entirely and df is still None
+        if self.filings_df is None:
+            logger.error(
+                f"Initial load/fetch failed for universe '{self.name}'. Cannot sync."
+            )
+            return
+
+        # 2. Identify missing filings
+        # get_missing_filings already handles None/empty self.filings_df after the load attempt
+        missing_combinations = self.get_missing_filings()
+
+        if not missing_combinations:
+            logger.info(
+                f"Filings for universe '{self.name}' are already complete. No sync needed."
+            )
+            return
+
+        logger.info(
+            f"Found {len(missing_combinations)} missing filing combinations to fetch for {self.get_tickers()} years {self.get_filing_years()}."
+        )
+        if len(missing_combinations) < 10:
+            logger.info(f"Missing items: {missing_combinations}")
+
+        # 3. Fetch *only* the missing filings
+        fetcher = self._get_fetcher()
+        try:
+            # NOTE: EDGARFetcher needs a new method like fetch_specific_filings
+            # This method should accept a list of dicts like {'ticker': 'T', 'filing_year': Y}
+            # and return a Polars DataFrame with the fetched data.
+            logger.info(
+                f"Attempting to fetch {len(missing_combinations)} missing filings..."
+            )
+            tickers_in_missing = list(
+                set(item["ticker"] for item in missing_combinations)
+            )
+
+            # Reuse existing CIK mapping logic if possible
+            cache_file_path = settings.output_dir / "cache" / "ticker_to_cik.json"
+            ticker_to_cik = load_ticker_to_cik_mapping(
+                tickers_in_missing, str(cache_file_path)
+            )
+            # Filter ticker_to_cik for only those needed in missing_combinations
+            ciks_to_fetch = {
+                t: cik for t, cik in ticker_to_cik.items() if t in tickers_in_missing
+            }
+            logger.info(
+                f"Found {len(ciks_to_fetch)} CIKs for {len(tickers_in_missing)} missing tickers."
+            )
+
+            missing_filings_df = fetcher.fetch_specific_filings(
+                missing_combinations, ciks_to_fetch
+            )
+
+            if missing_filings_df is None or missing_filings_df.is_empty():
+                logger.warning(
+                    f"Fetching missing filings returned no data for universe '{self.name}'. Local file will not be updated with new fetches."
+                )
+                # If fetch returned nothing, no need to proceed with combining/saving
+                logger.info(
+                    f"Filings sync process finished for universe '{self.name}' (no new data fetched)."
+                )
+                return
+
+            logger.info(
+                f"Successfully fetched {len(missing_filings_df)} missing filings."
+            )
+
+            # 4. Combine and save
+            # Ensure self.filings_df is a DataFrame before concatenating
+            if (
+                self.filings_df is None
+            ):  # Should not happen due to check above, but safety first
+                current_filings_df = pl.DataFrame()
+                logger.warning(
+                    "self.filings_df was None before combining, starting with empty DataFrame."
+                )
+            else:
+                current_filings_df = self.filings_df
+
+            # Use pl.concat for combining. 'vertical_relaxed' allows combining even if schemas
+            # differ slightly (e.g., new columns added), filling missing values with nulls.
+            combined_df = pl.concat(
+                [current_filings_df, missing_filings_df], how="vertical_relaxed"
+            )
+
+            # Drop duplicates based on key identifiers after combining
+            # Keep the 'first' entry encountered, assuming initial load is preferred over sync fetch if identical
+            key_columns = [
+                "ticker",
+                "filing_year",
+                "accession_number",
+            ]  # Adjust if accession_number isn't always present or unique enough
+            if all(col in combined_df.columns for col in key_columns):
+                combined_df = combined_df.unique(subset=key_columns, keep="first")
+            else:
+                logger.warning(
+                    f"Cannot drop duplicates using keys {key_columns} as one or more are missing. Skipping deduplication."
+                )
+
+            self.filings_df = combined_df
+            logger.info(f"Combined DataFrame now has {len(self.filings_df)} filings.")
+
+            # 5. Save the updated DataFrame directly using Polars
+            filings_path = self._get_filings_path(file_format)
+            logger.info(
+                f"Saving updated filings dataframe ({len(self.filings_df)} rows) directly to: {filings_path}"
+            )
+            try:
+                filings_path.parent.mkdir(
+                    parents=True, exist_ok=True
+                )  # Ensure directory exists
+                if file_format == "delta":
+                    self.filings_df.write_delta(str(filings_path), mode="overwrite")
+                elif file_format == "parquet":
+                    self.filings_df.write_parquet(str(filings_path))
+                elif file_format == "csv":
+                    self.filings_df.write_csv(str(filings_path))
+                else:
+                    logger.error(f"Unsupported file format '{file_format}' for saving.")
+                    return  # Don't mark as success if save failed
+
+                logger.info(f"Successfully synced and saved filings to {filings_path}")
+
+            except Exception as e:
+                logger.error(
+                    f"Error saving updated filings to {filings_path}: {e}",
+                    exc_info=True,
+                )
+
+        except FileNotFoundError as e:
+            # Raised by load_ticker_to_cik_mapping if cache file path is bad
+            logger.error(f"File not found during sync setup: {e}", exc_info=True)
+            # reraise if needed?
+        except Exception as e:
+            # Catch potential errors during the hypothetical fetch_specific_filings
+            logger.error(
+                f"Error during fetching process for missing filings (universe {self.name}): {e}",
+                exc_info=True,
+            )
+
+        logger.info(f"Filings sync process finished for universe '{self.name}'.")
+
 
 def load_from_json(
     filepath: str,
@@ -282,8 +532,6 @@ def load_from_json(
 
 def load_from_yaml(
     filepath: str,
-    start_year: Optional[int] = None,
-    end_year: Optional[int] = None,
     load_filings: bool = True,
 ) -> Universe:
     """
@@ -305,11 +553,7 @@ def load_from_yaml(
     default_name = path.stem
     universe_name = data.get("name", default_name)
 
-    universe = Universe(
-        name=universe_name,
-        start_year=start_year,
-        end_year=end_year,
-    )
+    universe = Universe(name=universe_name)
 
     for sec_data in data.get("securities", []):
         security = Security(
@@ -435,24 +679,40 @@ def get_universe_path(universe_name: str) -> Path:
 
 def load_universe(
     universe_name: str,
-    start_year: Optional[int] = None,
-    end_year: Optional[int] = None,
-    load_filings: bool = True,
+    load_filings: bool = False,
 ):
-    """
-    Load a universe by name, optionally loading associated SEC filings.
+    """Loads a Universe object from a config file (YAML preferred, JSON fallback).
 
     Args:
-        universe_name: Name or path of the universe file
-        start_year: Optional start year for filtering SEC filings
-        end_year: Optional end year for filtering SEC filings
-        load_filings: If True, automatically fetch or load associated SEC filings.
-    """
-    path = get_universe_path(universe_name)
+        universe_name: The name of the universe (without extension).
+        start_year: Optional start year for filtering filings (passed to Universe).
+        end_year: Optional end year for filtering filings (passed to Universe).
+        load_filings: Whether to automatically trigger fetching/loading of filings metadata.
+                      Set to False if the calling script (e.g., build_kb) handles this.
 
-    if path.suffix.lower() == ".json":
-        return load_from_json(str(path), start_year, end_year, load_filings)
-    elif path.suffix.lower() == ".yaml":
-        return load_from_yaml(str(path), start_year, end_year, load_filings)
+    Returns:
+        The loaded Universe object.
+
+    Raises:
+        FileNotFoundError: If neither YAML nor JSON config file is found.
+    """
+    universe_path = get_universe_path(universe_name)
+    logger.info(f"Loading universe from: {universe_path}")
+
+    if universe_path.suffix == ".yaml":
+        return load_from_yaml(str(universe_path), load_filings)
+    elif universe_path.suffix == ".json":
+        return load_from_json(str(universe_path), load_filings)
     else:
-        raise ValueError(f"Unsupported file format: {path.suffix}")
+        # This case should ideally not be reached if get_universe_path works correctly
+        raise FileNotFoundError(
+            f"No valid universe config file found for {universe_name} (checked .yaml and .json)"
+        )
+
+
+if __name__ == "__main__":
+    universe = load_universe("sectors/cloud_computing")
+    print(universe)
+    print(universe.get_missing_filings())
+    universe.sync_filings()
+    print(universe.get_missing_filings())

@@ -49,8 +49,7 @@ class AlphaLedgerSettings(BaseSettings):
     azure_openai_api_key: Optional[str] = None
     azure_openai_api_base: Optional[str] = None
     azure_openai_api_version: Optional[str] = None
-    azure_openai_embeding_deployment_id: Optional[str] = None
-    azure_openai_embeding_endpoint: Optional[str] = None
+    azure_openai_embedding_deployment_id: Optional[str] = None
     # SEC API settings
     sec_user_agent: str = Field(
         default="AlphaLedger (contact@alphaledger.com)",
@@ -77,10 +76,10 @@ class AlphaLedgerSettings(BaseSettings):
         validation_alias=AliasChoices("depth", "d"),
     )
     start_year: Optional[int] = Field(
-        default=2022, description="Start year for analysis period"
+        default=2020, description="Start year for analysis period"
     )
     end_year: Optional[int] = Field(
-        default=2023, description="End year for analysis period"
+        default=2024, description="End year for analysis period"
     )
     verbose: CliImplicitFlag[bool] = Field(
         default=True,
@@ -94,6 +93,18 @@ class AlphaLedgerSettings(BaseSettings):
     embedding_model: str = Field(
         default="text-embedding-3-small",
         description="Embedding model to use for the knowledge base",
+    )
+    embedding_dim: int = Field(
+        default=3072,
+        description="Embedding dimension to use for the knowledge base",
+    )
+    kb_chunk_size: int = Field(
+        default=1000,
+        description="Chunk size to use for the knowledge base",
+    )
+    kb_chunk_overlap: int = Field(
+        default=100,
+        description="Chunk overlap to use for the knowledge base",
     )
     kb_index_type: str = Field(
         default="IVF_PQ",

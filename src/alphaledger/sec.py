@@ -144,7 +144,7 @@ class EDGARFetcher:
         self.cache = HttpCache(cache_dir_str)
         self.cache.set_headers({"User-Agent": self.headers["User-Agent"]})
 
-    def get_company_filings(self, cik):
+    def get_company_filings(self, cik, custom_url: Optional[str] = None):
         """
         Get the list of filings for a company using the new SEC submissions API.
 
@@ -156,7 +156,11 @@ class EDGARFetcher:
         """
         # Format CIK with leading zeros to 10 digits
         cik_formatted = str(cik).zfill(10)
-        url = f"https://data.sec.gov/submissions/CIK{cik_formatted}.json"
+        if custom_url:
+            base_url = "https://data.sec.gov/submissions"
+            url = f"{base_url}/{custom_url}"
+        else:
+            url = f"https://data.sec.gov/submissions/CIK{cik_formatted}.json"
 
         logger.info(f"Fetching filings index from: {url}")
 
@@ -203,64 +207,127 @@ class EDGARFetcher:
         # Get all filings for the company
         filings_data = self.get_company_filings(cik)
         if not filings_data:
-            return pl.DataFrame()  # Return empty Polars DF
+            return pl.DataFrame()
 
-        # The recent filings are in the "filings" section
-        if "filings" not in filings_data or "recent" not in filings_data["filings"]:
+        all_filings_list = []
+
+        def extract_filings_from_data(filings_data):
+            filings_list = []
+            if isinstance(filings_data, dict):
+                if isinstance(filings_data.get("accessionNumber"), list):
+                    try:
+                        num_filings = len(filings_data.get("accessionNumber", []))
+                        keys = filings_data.keys()
+                        for i in range(num_filings):
+                            filing_dict = {
+                                key: filings_data[key][i]
+                                for key in keys
+                                if i < len(filings_data[key])
+                            }
+                            filings_list.append(filing_dict)
+                    except Exception as e:
+                        logger.error(
+                            f"Error processing potentially columnar 'recent' data for CIK {cik}: {e}"
+                        )
+                else:  # Assume it's already a list of dicts (the common case)
+                    filings_list.extend(filings_data)
+
+            return filings_list
+
+        # 1. Process recent filings (if they exist)
+        if "filings" in filings_data and "recent" in filings_data["filings"]:
+            recent_filings = filings_data["filings"]["recent"]
+            all_filings_list.extend(extract_filings_from_data(recent_filings))
+
+        if "filings" in filings_data and "files" in filings_data["filings"]:
+            historical_files_data = filings_data["filings"]["files"]
+
+            for file in historical_files_data:
+                logger.info(
+                    f"Fetching historical file submission file {file['name']} for CIK {cik}"
+                )
+                all_filings_list.extend(
+                    extract_filings_from_data(
+                        self.get_company_filings(cik, file["name"])
+                    )
+                )
+
+        if not all_filings_list:
             logger.warning(
-                f"Unexpected JSON structure for CIK {cik}. 'filings' or 'recent' key missing."
+                f"CIK {cik}: No filings found in 'recent' or 'files' sections."
             )
-            return pl.DataFrame()  # Return empty Polars DF
+            return pl.DataFrame()
 
-        recent_filings = filings_data["filings"]["recent"]
-
-        # Define expected columns and types for Polars DataFrame creation
-        # Use Polars types
+        # Define expected columns and types (can remain the same)
         expected_schema = {
             "accessionNumber": pl.Utf8,
-            "filingDate": pl.Utf8,  # Keep as string initially for processing
-            "reportDate": pl.Utf8,  # Keep as string initially for processing
+            "filingDate": pl.Utf8,
+            "reportDate": pl.Utf8,
             "form": pl.Utf8,
             "primaryDocument": pl.Utf8,
             "primaryDocDescription": pl.Utf8,
-            # Add other potential columns if needed, otherwise Polars handles unknowns
+            # Allow other columns to exist
         }
 
         try:
-            # Create Polars DataFrame directly from the list of dicts
-            filings_df = pl.DataFrame(recent_filings, schema_overrides=expected_schema)
+            # Create Polars DataFrame from the combined list
+            filings_df = pl.DataFrame(
+                all_filings_list, schema_overrides=expected_schema
+            )
         except Exception as e:
             logger.error(
-                f"Error creating Polars DataFrame from SEC filings data for CIK {cik}: {e}"
+                f"Error creating Polars DataFrame from combined SEC filings data for CIK {cik}: {e}",
+                exc_info=True,  # Add traceback
             )
-            return pl.DataFrame()  # Return empty Polars DF
+            # Log sample data for debugging
+            if all_filings_list:
+                logger.error(
+                    f"Sample problematic data for CIK {cik}: {all_filings_list[:2]}"
+                )
+            return pl.DataFrame()
 
-        # Check if essential columns exist after creation
-        # Ensure primaryDocument exists as it's now needed for the URL
+        # --- Debugging Step: Log raw data ---
+        if not filings_df.is_empty():
+            logger.debug(
+                f"Combined filings data columns for CIK {cik}: {filings_df.columns}"
+            )
+            logger.debug(
+                f"Combined filings data head for CIK {cik}:\n{filings_df.head(5)}"
+            )
+        else:
+            logger.debug(f"No combined filings data created for CIK {cik}.")
+        # --- End Debugging Step ---
+
+        # Check if essential columns exist (can remain the same)
         required_cols = [
             "form",
             "filingDate",
-            "reportDate",
+            # "reportDate", # Report date might be missing in older filings sometimes
             "accessionNumber",
             "primaryDocument",
         ]
-        if not all(col in filings_df.columns for col in required_cols):
+        # Check only for absolutely essential columns for filtering and URL generation
+        if not all(
+            col in filings_df.columns
+            for col in ["form", "accessionNumber", "primaryDocument", "filingDate"]
+        ):
             logger.warning(
-                f"Filing data structure is missing some required columns for CIK {cik} (incl. primaryDocument). Found: {filings_df.columns}"
+                f"Combined filing data structure is missing essential columns for CIK {cik}. Found: {filings_df.columns}. Needed: ['form', 'accessionNumber', 'primaryDocument', 'filingDate']"
             )
-            # Return empty if critical columns are missing
-            if not all(
-                col in filings_df.columns
-                for col in ["form", "accessionNumber", "primaryDocument"]
-            ):
-                return pl.DataFrame()
+            # Allow proceeding but log heavily
+            # return pl.DataFrame() # Maybe too strict?
 
-        # Filter only 10-K filings using Polars filter
-        form_10k_df = filings_df.filter(pl.col("form") == "10-K")
+        # Filter only 10-K filings using the 'form' column (this is now applied to the combined data)
+        # --- Corrected Filter ---
+        form_10k_df = filings_df.filter(pl.col("form") == "10-K")  # Use 'form' column
+        # --- End Correction ---
 
         if form_10k_df.is_empty():
-            logger.info(f"No 10-K filings found in the recent filings for CIK {cik}.")
-            return pl.DataFrame()  # Return empty Polars DF
+            # Log check for other forms too
+            logger.info(
+                f"No primary 10-K filings found (form='10-K') in the combined filings for CIK {cik}. Available forms: {filings_df['form'].unique().to_list()}"
+            )
+            return pl.DataFrame()
 
         # Process dates and add columns using Polars `with_columns`
         # Use Polars expressions for transformations
@@ -378,14 +445,14 @@ class EDGARFetcher:
         ticker_to_cik_mapping: Dict[str, str],
     ) -> pl.DataFrame:  # Updated return type
         """
-        Fetch 10-K filings for all securities in a Universe.
+        Fetch 10-K filings for all securities in a Universe based on its year range.
 
         Args:
-            universe: The Universe object containing securities
-            ticker_to_cik_mapping: Dictionary mapping tickers to CIK numbers
+            universe: The Universe object containing securities and year range.
+            ticker_to_cik_mapping: Dictionary mapping tickers to CIK numbers.
 
         Returns:
-            Polars DataFrame containing all filings for the universe
+            Polars DataFrame containing all filings found for the universe within its range.
         """
         all_filings_dfs: List[pl.DataFrame] = []  # List to hold Polars DataFrames
         filing_years = universe.get_filing_years()
@@ -454,6 +521,103 @@ class EDGARFetcher:
                 f"No filings found for any ticker in universe '{universe.name}'."
             )
             return pl.DataFrame()  # Return empty Polars DataFrame if no filings found
+
+    def fetch_specific_filings(
+        self,
+        filing_combinations: List[Dict[str, Union[str, int]]],
+        ticker_to_cik_mapping: Dict[str, str],
+    ) -> pl.DataFrame:
+        """
+        Fetch specific 10-K filings based on a list of (ticker, filing_year) combinations.
+
+        Args:
+            filing_combinations: List of dictionaries, each like {'ticker': 'T', 'filing_year': Y}.
+            ticker_to_cik_mapping: Dictionary mapping required tickers to CIK numbers.
+
+        Returns:
+            A Polars DataFrame containing the successfully fetched filings.
+        """
+        specific_filings_dfs: List[pl.DataFrame] = []
+        logger.info(
+            f"Starting fetch for {len(filing_combinations)} specific filing combinations."
+        )
+
+        processed_combinations = 0
+        for combo in filing_combinations:
+            ticker = combo.get("ticker")
+            year = combo.get("filing_year")
+
+            if not isinstance(ticker, str) or not isinstance(year, int):
+                logger.warning(f"Skipping invalid combination: {combo}")
+                continue
+
+            if ticker in ticker_to_cik_mapping:
+                cik = ticker_to_cik_mapping[ticker]
+                cik_formatted = str(cik).zfill(10)
+
+                logger.debug(
+                    f"Fetching specific filing for {ticker} (CIK: {cik_formatted}), year: {year}"
+                )
+
+                # Reuse existing search method, filtering by specific year
+                filing_df = self.search_10k_filings(ticker, cik_formatted, year=year)
+
+                if not filing_df.is_empty():
+                    # We expect only one 10-K per year, but search_10k_filings might return amendments.
+                    # Filter further if needed, or just take the first one.
+                    # For simplicity, let's assume search_10k_filings is precise enough or take the latest if multiple.
+                    if len(filing_df) > 1:
+                        logger.warning(
+                            f"Found {len(filing_df)} filings for {ticker} in year {year}. Using the latest based on filingDate."
+                        )
+                        # Ensure 'filing_date_dt' exists and is sortable
+                        if (
+                            "filing_date_dt" in filing_df.columns
+                            and filing_df["filing_date_dt"].dtype == pl.Date
+                        ):
+                            filing_df = filing_df.sort(
+                                "filing_date_dt", descending=True
+                            ).head(1)
+                        else:
+                            # Fallback if date conversion failed or column missing
+                            filing_df = filing_df.head(1)
+
+                    specific_filings_dfs.append(filing_df)
+                    logger.debug(
+                        f"Successfully fetched filing for {ticker}, year {year}."
+                    )
+                else:
+                    logger.warning(
+                        f"Did not find 10-K filing for {ticker}, year {year}."
+                    )
+
+                processed_combinations += 1
+                if processed_combinations % 5 == 0:  # Add delay every few requests
+                    time.sleep(self.request_interval * 1.5)
+                else:
+                    time.sleep(self.request_interval)  # Standard delay
+
+            else:
+                logger.warning(
+                    f"Skipping {ticker} year {year}: CIK not found in provided mapping."
+                )
+
+        # Combine results
+        if specific_filings_dfs:
+            combined_df = pl.concat(specific_filings_dfs, how="vertical_relaxed")
+            # Add processing date/time
+            combined_df = combined_df.with_columns(
+                pl.lit(datetime.now()).alias("processed_datetime")
+            )
+            logger.info(
+                f"Finished fetching. Combined {len(combined_df)} specific filings successfully."
+            )
+            return combined_df
+        else:
+            logger.info(
+                "Finished fetching specific filings. No new filings were found."
+            )
+            return pl.DataFrame()  # Return empty DataFrame if nothing was fetched
 
     def save_filings_to_disk(
         self,
