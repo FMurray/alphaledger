@@ -107,8 +107,18 @@ def build_kb() -> None:
             f"Building knowledge base from [bold blue]{settings.universe_name}[/bold blue]..."
         )
 
-    # Call the implementation in the knowledge_base module
     kb_build(log)
+
+
+def process_universe_xbrl() -> None:
+    """
+    Process the XBRL data for the universe.
+    """
+    from alphaledger.universe import Universe
+    from alphaledger.config import settings
+
+    universe = Universe(settings.universe_name)
+    universe.process_xbrl()
 
 
 def patch_cyd_taxonomy():

@@ -4,7 +4,7 @@ Module for processing XBRL financial filings.
 
 import re
 import logging
-from typing import Dict, Any, List, Optional, Set, Union, cast
+from typing import Dict, Any, List, Optional, Set, Union, cast, Tuple
 from enum import Flag, auto, Enum
 from xbrl.instance import XbrlInstance, AbstractFact, NumericFact, TextFact
 from xbrl.cache import HttpCache
@@ -430,15 +430,23 @@ class IXBRLDocumentParser:
                     matched_facts_count += 1
                     fact_obj = self.facts_by_id[tag_id]
                     # Verification step: Check if concept name matches
+                    local_tag_name = None  # Initialize local_tag_name
                     if tag_name_attr and ":" in tag_name_attr:
                         # Split only on the first colon
                         parts = tag_name_attr.split(":", 1)
                         if len(parts) == 2:
                             local_tag_name = parts[1]  # Get the part after the prefix
 
-                    if tag_name_attr and fact_obj.concept.name != local_tag_name:
-                        logging.warning(
-                            f"ID MATCH, NAME MISMATCH for id='{tag_id}': HTML name='{tag_name_attr}' (local='{local_tag_name}'), Fact concept.name='{fact_obj.concept.name}'"
+                    # Check for mismatch only if local_tag_name was successfully extracted
+                    if local_tag_name is not None:
+                        if fact_obj.concept.name != local_tag_name:
+                            logging.warning(
+                                f"ID MATCH, NAME MISMATCH for id='{tag_id}': HTML name='{tag_name_attr}' (local='{local_tag_name}'), Fact concept.name='{fact_obj.concept.name}'"
+                            )
+                    elif tag_name_attr:
+                        # Log if tag_name_attr exists but didn't have a colon or expected format
+                        logging.debug(
+                            f"ID MATCH, HTML name='{tag_name_attr}' has no prefix or unexpected format. Skipping name comparison."
                         )
                     elif not tag_name_attr:
                         logging.warning(
@@ -1336,3 +1344,83 @@ def save_facts_to_delta(
 
     # Write to Delta table
     df.write.format("delta").mode("append").saveAsTable(table_name)
+
+
+def process_filing_urls(filings_df: pl.DataFrame) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    """
+    Processes a list of XBRL filing URLs, extracts numeric and text facts,
+    and aggregates them into separate Polars DataFrames.
+
+    Args:
+        filing_urls: A list of URLs pointing to XBRL instance documents.
+        cache: An initialized HttpCache object for fetching and caching files.
+
+    Returns:
+        A tuple containing two Polars DataFrames:
+        1. Aggregated numeric facts DataFrame.
+        2. Aggregated text facts DataFrame.
+    """
+    from xbrl.cache import HttpCache
+
+    cache = HttpCache(cache_dir="./cache")
+
+    all_numeric_facts_df = pl.DataFrame(schema=TARGET_SCHEMA_NUMERIC_POLARS)
+    all_text_facts_df = pl.DataFrame(schema=TARGET_SCHEMA_TEXT_POLARS)
+
+    try:
+        from xbrl.instance import XbrlParser
+    except ImportError:
+        logging.error("py-xbrl package not installed. Run: pip install py-xbrl")
+        return all_numeric_facts_df, all_text_facts_df  # Return empty DFs
+
+    parser = XbrlParser(cache)
+    doc_parser = IXBRLDocumentParser(cache)
+
+    for record in filings_df.iter_rows(named=True):
+        url = record["xbrl_instance_url"]
+        try:
+            inst = parser.parse_instance(url)
+            if not inst:
+                logging.warning(f"Skipping {url}: Instance parsing failed.")
+                continue
+
+            # Parse the document structure
+            document = doc_parser.parse(xbrl_instance=inst)
+
+            # Create the two separate DataFrames
+            numeric_df = document.to_numeric_dataframe()
+            text_df = document.to_text_dataframe()
+
+            # Concatenate into respective accumulators
+            if not numeric_df.is_empty():
+                all_numeric_facts_df = pl.concat(
+                    [all_numeric_facts_df, numeric_df], how="vertical"
+                )
+            if not text_df.is_empty():
+                all_text_facts_df = pl.concat(
+                    [all_text_facts_df, text_df], how="vertical"
+                )
+
+        except Exception as e:
+            logging.error(f"ERROR processing {url}: {e}")
+            # Optionally include traceback for detailed debugging
+            # import traceback
+            # traceback.print_exc()
+
+    logging.info("Processing complete.")
+    logging.info(f"Final Numeric DF shape: {all_numeric_facts_df.shape}")
+    logging.info(f"Final Text DF shape: {all_text_facts_df.shape}")
+
+    return all_numeric_facts_df, all_text_facts_df
+
+
+if __name__ == "__main__":
+    from alphaledger.universe import Universe
+    from alphaledger.config import settings
+
+    universe = Universe(settings.universe_name)
+    filings_df = universe.get_filings()
+
+    numeric_df, text_df = process_filing_urls(filings_df)
+    numeric_df.write_delta(settings.output_dir / "numeric_facts")
+    text_df.write_delta(settings.output_dir / "text_facts")

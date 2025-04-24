@@ -8,28 +8,39 @@ Install uv [reference](https://docs.astral.sh/uv/getting-started/installation/)
 
 ## Usage
 
+_N.B._
+`uv run alphaledger -h|--help` for help
+
 ### Universes
+
+Universes define collections of securities for analysis. A universe is comprised of some number of securities and an analysis period. The lists of securities can be defined in YAML or JSON format, typically within the `universes/` directory (or subdirectories). Currently they won't be assigned an analysis period until loaded.
+
+# Example structure:
+# - `universes/indices/sp500.yaml`
+# - `universes/sectors/cloud_computing.yaml`
+# - `universes/my_custom_stocks.json`
+
+#### Using Universes in Code
 
 ```python
 from alphaledger.universe import load_universe
-# Load a universe
-universe = load_universe("cloud_computing")
+# Load a universe by name (finds .yaml or .json in universe_dir)
+# It handles subdirectories automatically.
+cloud_stocks = load_universe("sectors/cloud_computing")
+sp500 = load_universe("indices/sp500")
+
 # Access securities
-for ticker in universe.get_tickers():
-    security = universe.get_security(ticker)
-    print(f"{ticker}: {security.name} ({security.sector})")
-# Filter by sector
-tech_securities = [s for s in universe.get_all_securities()
-if s.sector == "Information Technology"]
+print(f"Loaded universe: {cloud_stocks.name} with {len(cloud_stocks)} securities.")
+print(f"Tickers: {cloud_stocks.get_tickers()[:5]}...") # Show first 5 tickers
+
+msft_info = cloud_stocks.get_security("MSFT")
+if msft_info:
+    print(f"Info for MSFT: {msft_info.name} (Sector: {msft_info.sector})")
+
+## Filter by sector (example)
+#tech_securities = [s for s in universe.get_all_securities()
+#if s.sector == "Information Technology"]
 ```
-
-Universes define collections of securities for analysis. They are stored in YAML or JSON format in the `universes/` directory:
-
-- `universes/indices/` - Major market indices (S&P 500, NASDAQ, etc.)
-- `universes/sectors/` - Sector-based collections (Technology, Healthcare, etc.)
-- `universes/custom/` - Your custom universes
-
-#### Using Universes in Code
 
 
 ### Processing Financial Filings (iXBRL)
@@ -96,6 +107,58 @@ except Exception as e:
 5.  **`parsed_doc.to_string(formatter)`:** The core method to generate the final string output according to the chosen formatter and options.
 
 *(Future Work: A `FactExtractor` class will be added to specifically extract structured fact data (e.g., for databases) based on `ProcessingOptions`.)*
+
+#### Extracting Structured Fact Data
+
+Beyond formatted text output, the `IXBRLDocument` object provides methods to extract structured data directly into Polars DataFrames. This is useful for quantitative analysis and data storage.
+
+```python
+# Assuming 'parsed_doc' is an IXBRLDocument object obtained from IXBRLDocumentParser.parse()
+
+# 1. Extract Numeric Facts
+# Returns a Polars DataFrame containing only NumericFact instances
+# Schema defined by TARGET_SCHEMA_NUMERIC_POLARS in process_xbrl.py
+numeric_facts_df = parsed_doc.to_numeric_dataframe()
+print("--- Numeric Facts DataFrame ---")
+print(numeric_facts_df.head())
+
+# Example: Calculate total revenue from the extracted facts
+# Note: This requires the 'Revenue' concept to be present and numeric
+# revenue_total = numeric_facts_df.filter(
+#     pl.col("concept_name") == "Revenue"
+# )["fact_value"].sum()
+# print(f"\nTotal Revenue: {revenue_total}")
+
+# 2. Extract Text Facts
+# Returns a Polars DataFrame containing only TextFact instances (and other non-numeric types)
+# Schema defined by TARGET_SCHEMA_TEXT_POLARS in process_xbrl.py
+text_facts_df = parsed_doc.to_text_dataframe()
+print("\n--- Text Facts DataFrame ---")
+print(text_facts_df.head())
+
+# Example: Find specific text information
+# accounting_policies = text_facts_df.filter(
+#     pl.col("concept_name").str.contains("AccountingPolicy")
+# )
+# print("\nAccounting Policies:")
+# print(accounting_policies)
+
+# 3. Extract All Facts (Combined) - Less common, usually prefer separated DFs
+# Returns a Polars DataFrame containing all fact types, conforming to TARGET_SCHEMA_POLARS
+# Numeric values are cast to float, text values remain strings.
+# all_facts_df = parsed_doc.to_dataframe(format="polars")
+# print("\n--- All Facts DataFrame ---")
+# print(all_facts_df.head())
+
+# Note: The underlying `process_filing_urls` function leverages these methods
+# to process multiple filings and aggregate facts efficiently.
+```
+
+**Explanation:**
+
+*   **`parsed_doc.to_numeric_dataframe()`:** Extracts all `NumericFact` objects found during parsing into a Polars DataFrame. The schema includes fields like `concept_name`, `fact_value` (as float), `unit`, `period_start`, `period_end`, etc.
+*   **`parsed_doc.to_text_dataframe()`:** Extracts all non-numeric facts (like `TextFact`) into a Polars DataFrame. The schema includes `concept_name`, `fact_value` (as string), `period_start`, `period_end`, etc.
+*   **Schemas:** The exact columns and data types are defined by `TARGET_SCHEMA_NUMERIC_POLARS` and `TARGET_SCHEMA_TEXT_POLARS` within `src/alphaledger/process_xbrl.py`.
 
 
 ### Scripts
