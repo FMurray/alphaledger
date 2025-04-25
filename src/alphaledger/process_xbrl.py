@@ -1441,7 +1441,7 @@ def save_facts_to_delta(
     df.write.format("delta").mode("append").saveAsTable(table_name)
 
 
-def process_filing_urls_structured(
+def process_filings_structured(
     filings_df: pl.DataFrame,
 ) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """
@@ -1567,7 +1567,7 @@ def process_filing_urls_structured(
     return all_numeric_facts_df, all_text_facts_df
 
 
-def process_filing_urls_direct(
+def process_filings_structured(
     filings_df: pl.DataFrame,
 ) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """
@@ -1706,7 +1706,7 @@ if __name__ == "__main__":
 
         # Ensure metadata is available
         logger.info("Ensuring filings metadata is available...")
-        universe.ensure_filings_available()
+        universe.collect_filings()
 
         # Get the filings metadata DataFrame (required input for processing functions)
         filings_lf = universe.get_filings_lazy()
@@ -1736,7 +1736,7 @@ if __name__ == "__main__":
                     )
 
                     if PROCESS_METHOD == "direct":
-                        numeric_df, text_df = process_filing_urls_direct(filings_df)
+                        numeric_df, text_df = process_filings_structured(filings_df)
                         # Define output paths for direct facts
                         numeric_path = (
                             settings.output_dir
@@ -1747,7 +1747,7 @@ if __name__ == "__main__":
                             / f"{universe.name}_text_facts_direct.delta"
                         )
                     else:  # structured
-                        numeric_df, text_df = process_filing_urls_structured(filings_df)
+                        numeric_df, text_df = process_filings_structured(filings_df)
                         # Define output paths for structured facts
                         numeric_path = (
                             settings.output_dir

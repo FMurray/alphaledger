@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 from alphaledger.sec import EDGARFetcher, load_ticker_to_cik_mapping
 from alphaledger import get_logger
 from alphaledger.process_xbrl import (
-    process_filing_urls_direct,
+    process_filings_structured,
     TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
     TARGET_SCHEMA_NUMERIC_POLARS,
 )
@@ -139,7 +139,7 @@ class Universe:
     file upon instantiation. Initializes a LazyFrame (`filings_lf`)
     pointing to the expected filings *metadata* file if it exists.
 
-    Use `ensure_filings_available()` to create or update the filings *metadata* file.
+    Use `collect_filings()` to create or update the filings *metadata* file.
     Use `get_filings_lazy()` to access the filings *metadata* lazily.
     Numeric/text facts require separate processing & storage.
     """
@@ -205,7 +205,7 @@ class Universe:
                 self.filings_lf = None  # Set to None if scan fails
         else:
             logger.info(
-                f"Filings metadata file not found at expected path: {filings_path}. Run ensure_filings_available() to create it."
+                f"Filings metadata file not found at expected path: {filings_path}. Run collect_filings() to create it."
             )
             self.filings_lf = None
 
@@ -451,7 +451,7 @@ class Universe:
         ]
         return missing_list
 
-    def ensure_filings_available(self, force_check: bool = False) -> None:
+    def collect_filings(self, force_check: bool = False) -> pl.LazyFrame:
         """
         Ensures the local filings *metadata* file (e.g., Delta table) is created and complete.
 
@@ -496,6 +496,7 @@ class Universe:
                     self.filings_lf = self._scan_filings_file(
                         filings_path, self.file_format
                     )
+                    return self.filings_lf
                 except Exception as e:
                     logger.error(
                         f"Failed to scan presumably complete metadata file {filings_path}: {e}",
@@ -662,7 +663,7 @@ class Universe:
         """
         Returns a LazyFrame pointing to the SEC filings *metadata* file for this universe,
         if the file exists and was successfully scanned during initialization or
-        after `ensure_filings_available()`.
+        after `collect_filings()`.
 
         Returns None if the file does not exist or could not be scanned.
         Does NOT trigger loading data into memory or fetching from network.
@@ -723,7 +724,7 @@ class Universe:
         Returns:
             A Polars LazyFrame pointing to the universe's numeric facts data.
             Returns None if the essential filings metadata (`filings_lf`) cannot be
-            obtained (e.g., after running ensure_filings_available).
+            obtained (e.g., after running collect_filings).
             Returns an empty LazyFrame if no filings are found or processing fails.
         """
         numeric_facts_path = self._get_numeric_facts_path()
@@ -763,7 +764,7 @@ class Universe:
         if filings_lf is None:
             logger.warning(
                 f"Filings metadata LazyFrame not available for '{self.name}'. "
-                f"Run ensure_filings_available() first. Cannot process numeric facts."
+                f"Run collect_filings() first. Cannot process numeric facts."
             )
             # Cannot proceed without metadata
             return None
@@ -832,7 +833,7 @@ class Universe:
 
         # 4. Process all URLs for the universe using the direct method
         try:
-            numeric_facts_df, _ = process_filing_urls_direct(universe_filings_df)
+            numeric_facts_df, _ = process_filings_structured(universe_filings_df)
             logger.info(
                 f"Successfully processed facts for universe '{self.name}'. Found {len(numeric_facts_df)} total numeric facts."
             )
@@ -975,7 +976,7 @@ class Universe:
         if self.filings_lf is None:
             logger.warning(
                 f"Filings metadata LazyFrame not available for '{self.name}'. "
-                f"Run ensure_filings_available() first. Cannot fetch facts for {ticker}."
+                f"Run collect_filings() first. Cannot fetch facts for {ticker}."
             )
             # Cannot proceed without metadata
             return None  # Return None as we cannot even attempt processing
@@ -1019,7 +1020,7 @@ class Universe:
 
         # 4. Process the URLs using the function from process_xbrl
         try:
-            numeric_facts_df, _ = process_filing_urls_direct(ticker_filings_df)
+            numeric_facts_df, _ = process_filings_structured(ticker_filings_df)
             logger.info(
                 f"Successfully processed facts for {ticker}. Found {len(numeric_facts_df)} numeric facts."
             )
@@ -1190,10 +1191,8 @@ if __name__ == "__main__":
         print(f"get_filings_lazy() returns: {meta_lf}")
         assert meta_lf is None
 
-        # --- 3. Run ensure_filings_available (MOCK - Creates the *metadata* file) ---
-        print(
-            "\n--- 3. Run ensure_filings_available (Mocked Fetch - Creates Metadata File) ---"
-        )
+        # --- 3. Run collect_filings (MOCK - Creates the *metadata* file) ---
+        print("\n--- 3. Run collect_filings (Mocked Fetch - Creates Metadata File) ---")
         try:
             mock_fetcher = MagicMock(spec=EDGARFetcher)
 
@@ -1227,7 +1226,7 @@ if __name__ == "__main__":
             )
             example_universe._fetcher = mock_fetcher
 
-            example_universe.ensure_filings_available()
+            example_universe.collect_filings()
             print(example_universe)
             assert (
                 example_universe.filings_lf is not None
@@ -1237,7 +1236,7 @@ if __name__ == "__main__":
             print("Skipping ensure_filings test: Mocking library not available.")
         except Exception as e:
             print(
-                f"An error occurred during ensure_filings_available mock run: {e}",
+                f"An error occurred during collect_filings mock run: {e}",
                 exc_info=True,
             )
 
@@ -1261,7 +1260,7 @@ if __name__ == "__main__":
                 )
         else:
             print(
-                "Cannot test getting metadata: filings_lf is still None after ensure_filings_available."
+                "Cannot test getting metadata: filings_lf is still None after collect_filings."
             )
 
         # --- 5. Initialize new instance - should detect existing *metadata* file ---

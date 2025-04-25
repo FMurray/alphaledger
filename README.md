@@ -1,5 +1,4 @@
-# AlphaLedger
-
+# AlphaLedger - Generative AI toolkit for open finance data
 
 ## Installation
 
@@ -8,63 +7,54 @@ Install uv [reference](https://docs.astral.sh/uv/getting-started/installation/)
 
 ## Usage
 
-_N.B._
-`uv run alphaledger -h|--help` for help
+alphaledger uses pydantic settings for configuration management. There are three ways to customize the configuration:
+1. set values in `.env` at the project root (copy `.env.template`) or in your shell
+2. cli args - these are the 'kebab-cased' version of the env vars
+3. at runtime by `from alphaledger.config import settings; settings.my_var = 'foo'`
+
+use `from alphaledger import logger; log.info, etc.` for Rich logging to stdout 
+
+_N.B.'s_
+- `uv run alphaledger -h|--help` for help
+- when running from a notebook or executing alphaledger via uv use `sys.argv = [sys.argv[0]]` to override required cli args
 
 ### Universes
 
-Universes define collections of securities for analysis. A universe is comprised of some number of securities and an analysis period. The lists of securities can be defined in YAML or JSON format, typically within the `universes/` directory (or subdirectories). Currently they won't be assigned an analysis period until loaded.
+Universes define collections of securities for analysis. A universe is comprised of some number of securities and an analysis period. The lists of securities can be defined in YAML or JSON format, typically within the `universes/` directory (or subdirectories). Currently they won't be assigned an analysis period until loaded (the values set in config.settings will be used).
 
-# Example structure:
-# - `universes/indices/sp500.yaml`
-# - `universes/sectors/cloud_computing.yaml`
-# - `universes/my_custom_stocks.json`
+Example structure:
+- `universes/indices/sp500.yaml`
+- `universes/sectors/cloud_computing.yaml`
+- `universes/my_custom_stocks.json`
 
 #### Using Universes in Code
 
 ```python
-from alphaledger.universe import load_universe
+from alphaledger.universe import Universe
 # Load a universe by name (finds .yaml or .json in universe_dir)
 # It handles subdirectories automatically.
-cloud_stocks = load_universe("sectors/cloud_computing")
-sp500 = load_universe("indices/sp500")
-
-# Access securities
-print(f"Loaded universe: {cloud_stocks.name} with {len(cloud_stocks)} securities.")
-print(f"Tickers: {cloud_stocks.get_tickers()[:5]}...") # Show first 5 tickers
-
-msft_info = cloud_stocks.get_security("MSFT")
-if msft_info:
-    print(f"Info for MSFT: {msft_info.name} (Sector: {msft_info.sector})")
-
-## Filter by sector (example)
-#tech_securities = [s for s in universe.get_all_securities()
-#if s.sector == "Information Technology"]
+cloud_stocks = Universe("sectors/cloud_computing")
+sp500 = Universe("indices/sp500")
 ```
 
+Universes are lazy-loaded and the public APIs generally return polars lazy frames [lazy-loaded](https://docs.pola.rs/user-guide/lazy/). Creating a universe instance will just load the metadata. To collect filings `universe.collect_filings()` will:
+- Check existing metadata to find missing (ticker, year) pairs. This will be the whole universe when initalizing from scratch. 
+- Fetch the needed filings and associated metadata from SEC EDGAR. This step uses an HTTP cache on disk. _n.b.:_ populate the user agent value in env or set it manually with:
+    `from alphaledger.config import settings; settings.sec_user_agent(<your email>)`
+- XBRL facts are also lazy loaded, you can collect all numeric facts or text facts with:
+    `universe.get_numeric_facts()`
+- To get only facts for a single security:
+    `universe.get_security_numeric_facts("AMZ")`
 
-### Processing Financial Filings (iXBRL)
 
-AlphaLedger includes tools to parse and process iXBRL (Inline XBRL) documents, often found in SEC filings. This allows extracting both textual content and tagged financial facts.
+### Processing Financial Filings (XBRL + iXBRL)
+
+Currenly alphaledger just handles 10k filings from SEC EDGAR. There are two modalities, structured and unstructured. Structured APIs (e.g. `process_filings_structured`) extract only the XBRL entities from an instance. Unstructured APIs are used for aligning facts within the unstructured filing document (iXBRL).
+
+
+#### Working with unstructured APIs using IXBRLDocumentParser
 
 ```python
-import logging
-from alphaledger.process_xbrl import IXBRLDocumentParser, ProcessingOptions, extract_us_gaap_facts
-from alphaledger.formatter import MarkdownFormatter, PlainTextFormatter
-# Assuming you have fetched an iXBRL file (e.g., filing.htm) and potentially parsed it with py-xbrl
-# from xbrl.instance import XbrlParser
-# parser = XbrlParser()
-# xbrl_doc = parser.parse_instance("path/to/filing.htm") # Or raw content
-# all_facts = xbrl_doc.get_facts()
-
-# --- Placeholder for getting facts ---
-# In a real scenario, you'd get 'all_facts' from parsing the document with py-xbrl
-all_facts = []
-instance_path = "path/to/your/downloaded/filing.htm"
-encoding = "utf-8" # Or detect encoding
-# --- End Placeholder ---
-
-# 1. Initialize the Parser
 # Provide the path to the iXBRL file and the list of facts extracted by py-xbrl
 try:
     ixbrl_parser = IXBRLDocumentParser(instance_path=instance_path, facts=all_facts, encoding=encoding)
@@ -106,60 +96,9 @@ except Exception as e:
 4.  **Formatters (`MarkdownFormatter`, `PlainTextFormatter`, etc.):** These classes take the `ProcessingOptions` and define how to render the `IXBRLDocument` structure into a string. They control section formatting, text formatting, and fact formatting (including how `TextFact` instances are displayed - truncated for lower detail levels, full for higher levels).
 5.  **`parsed_doc.to_string(formatter)`:** The core method to generate the final string output according to the chosen formatter and options.
 
-*(Future Work: A `FactExtractor` class will be added to specifically extract structured fact data (e.g., for databases) based on `ProcessingOptions`.)*
+### Knowledge Base
 
-#### Extracting Structured Fact Data
-
-Beyond formatted text output, the `IXBRLDocument` object provides methods to extract structured data directly into Polars DataFrames. This is useful for quantitative analysis and data storage.
-
-```python
-# Assuming 'parsed_doc' is an IXBRLDocument object obtained from IXBRLDocumentParser.parse()
-
-# 1. Extract Numeric Facts
-# Returns a Polars DataFrame containing only NumericFact instances
-# Schema defined by TARGET_SCHEMA_NUMERIC_POLARS in process_xbrl.py
-numeric_facts_df = parsed_doc.to_numeric_dataframe()
-print("--- Numeric Facts DataFrame ---")
-print(numeric_facts_df.head())
-
-# Example: Calculate total revenue from the extracted facts
-# Note: This requires the 'Revenue' concept to be present and numeric
-# revenue_total = numeric_facts_df.filter(
-#     pl.col("concept_name") == "Revenue"
-# )["fact_value"].sum()
-# print(f"\nTotal Revenue: {revenue_total}")
-
-# 2. Extract Text Facts
-# Returns a Polars DataFrame containing only TextFact instances (and other non-numeric types)
-# Schema defined by TARGET_SCHEMA_TEXT_POLARS in process_xbrl.py
-text_facts_df = parsed_doc.to_text_dataframe()
-print("\n--- Text Facts DataFrame ---")
-print(text_facts_df.head())
-
-# Example: Find specific text information
-# accounting_policies = text_facts_df.filter(
-#     pl.col("concept_name").str.contains("AccountingPolicy")
-# )
-# print("\nAccounting Policies:")
-# print(accounting_policies)
-
-# 3. Extract All Facts (Combined) - Less common, usually prefer separated DFs
-# Returns a Polars DataFrame containing all fact types, conforming to TARGET_SCHEMA_POLARS
-# Numeric values are cast to float, text values remain strings.
-# all_facts_df = parsed_doc.to_dataframe(format="polars")
-# print("\n--- All Facts DataFrame ---")
-# print(all_facts_df.head())
-
-# Note: The underlying `process_filing_urls` function leverages these methods
-# to process multiple filings and aggregate facts efficiently.
-```
-
-**Explanation:**
-
-*   **`parsed_doc.to_numeric_dataframe()`:** Extracts all `NumericFact` objects found during parsing into a Polars DataFrame. The schema includes fields like `concept_name`, `fact_value` (as float), `unit`, `period_start`, `period_end`, etc.
-*   **`parsed_doc.to_text_dataframe()`:** Extracts all non-numeric facts (like `TextFact`) into a Polars DataFrame. The schema includes `concept_name`, `fact_value` (as string), `period_start`, `period_end`, etc.
-*   **Schemas:** The exact columns and data types are defined by `TARGET_SCHEMA_NUMERIC_POLARS` and `TARGET_SCHEMA_TEXT_POLARS` within `src/alphaledger/process_xbrl.py`.
-
+The current knowledge base implementation uses [LanceDB](https://lancedb.github.io/) for local index creation/storage/retrieval. 
 
 ### Scripts
 
@@ -218,32 +157,5 @@ results = local_kb.search("cloud revenue growth", limit=5)
 for doc in results:
     print(f"{doc.ticker}: {doc.text} ({doc.date}) - Relevance: {doc.score}")
 ```
-
-
-#### Logging
-
-```python
-# At the top of each module, import the logger:
-from alphaledger import get_logger
-
-# Create a module-specific logger:
-logger = get_logger(__name__)
-
-# Use the logger with rich formatting:
-logger.debug("Processing [bold]data[/bold]...")
-logger.info("Operation [green]successful[/green]")
-logger.warning("[yellow]Warning:[/yellow] Incomplete data found")
-logger.error("[bold red]Error:[/bold red] Failed to connect to database")
-logger.critical("[white on red]CRITICAL:[/white on red] System shutdown required")
-
-# For dynamic values, use f-strings or format:
-user_input = "example"
-logger.info(f"Processing user input: [blue]{user_input}[/blue]")
-
-# For conditional logging (better performance):
-if logger.isEnabledFor(logging.DEBUG):
-    logger.debug(f"Complex calculation result: {expensive_calculation()}")
-```
-
 
 
