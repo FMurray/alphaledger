@@ -3,7 +3,6 @@ Module for processing XBRL financial filings.
 """
 
 import re
-import logging
 from typing import Dict, Any, List, Optional, Set, Union, cast, Tuple
 from enum import Flag, auto, Enum
 from xbrl.instance import XbrlInstance, AbstractFact, NumericFact, TextFact
@@ -20,6 +19,11 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .formatter import DocumentFormatter  # Import for type hinting
+
+
+from alphaledger import get_logger
+
+logger = get_logger(__name__)
 
 # Define the target schema outside the method for clarity and reuse
 TARGET_SCHEMA_POLARS = {
@@ -56,6 +60,9 @@ COMMON_COLUMNS = {
     "context_id": pl.Utf8,
     "context_entity": pl.Utf8,
     "context_scenario": pl.Utf8,
+    # Add filing dates
+    "filing_date": pl.Date,
+    "report_date": pl.Date,
 }
 
 TARGET_SCHEMA_NUMERIC_POLARS = {
@@ -74,6 +81,26 @@ TARGET_SCHEMA_TEXT_POLARS = {
     **COMMON_COLUMNS,
     "fact_value": pl.Utf8,
     # Text facts usually don't have units or numeric metadata
+}
+
+# --- Schemas for Direct Extraction (without section_name) ---
+COMMON_COLUMNS_DIRECT = {k: v for k, v in COMMON_COLUMNS.items() if k != "section_name"}
+
+TARGET_SCHEMA_NUMERIC_DIRECT_POLARS = {
+    **COMMON_COLUMNS_DIRECT,
+    "fact_value": pl.Float64,
+    "unit": pl.Utf8,
+    "metadata": pl.Struct(
+        [
+            pl.Field("decimals", pl.Int64),
+            pl.Field("precision", pl.Int64),
+        ]
+    ),
+}
+
+TARGET_SCHEMA_TEXT_DIRECT_POLARS = {
+    **COMMON_COLUMNS_DIRECT,
+    "fact_value": pl.Utf8,
 }
 
 
@@ -163,7 +190,7 @@ class IXBRLDocument:
 
             except Exception as e:
                 # Log error if DataFrame creation fails even with schema
-                logging.error(
+                logger.error(
                     f"Failed to create DataFrame with schema, rows may be incompatible: {e}"
                 )
                 # Return an empty DataFrame matching the schema as a fallback
@@ -195,6 +222,8 @@ class IXBRLDocument:
 
     def _fact_to_row(self, fact: AbstractFact, section_title: str) -> Dict[str, Any]:
         """Converts any fact to a dictionary row with common fields."""
+        # Add INFO log here
+        logger.info(f"[_fact_to_row] Processing fact: {fact.concept.name}")
         row_base = {}
         # Basic Info
         row_base["concept_name"] = fact.concept.name
@@ -204,6 +233,14 @@ class IXBRLDocument:
 
         # Period Info
         period = getattr(fact, "period", None)
+        # -- DEBUGGING --
+        if period:
+            logger.debug(
+                f"Fact {fact.concept.name}: Period found - Instant: {getattr(period, 'instant', None)} (Type: {type(getattr(period, 'instant', None))}), Start: {getattr(period, 'start_date', None)} (Type: {type(getattr(period, 'start_date', None))}), End: {getattr(period, 'end_date', None)} (Type: {type(getattr(period, 'end_date', None))})"
+            )
+        else:
+            logger.debug(f"Fact {fact.concept.name}: No period object found on fact.")
+        # ---------------
         if period:
             row_base["period_instant"] = getattr(period, "instant", None)
             row_base["period_start"] = getattr(period, "start_date", None)
@@ -221,7 +258,11 @@ class IXBRLDocument:
         return row_base
 
     def _numeric_fact_to_row(
-        self, fact: NumericFact, section_title: str
+        self,
+        fact: NumericFact,
+        section_title: str,
+        filing_date: Optional[Any] = None,
+        report_date: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Converts a NumericFact to a dictionary row conforming to numeric schema."""
         # 1. Initialize row with None for all target keys
@@ -235,6 +276,12 @@ class IXBRLDocument:
         for key, value in common_fields.items():
             if key in row:
                 row[key] = value
+
+        # Add filing dates if provided
+        if "filing_date" in row:
+            row["filing_date"] = filing_date
+        if "report_date" in row:
+            row["report_date"] = report_date
 
         # 4. Populate Numeric Specific Fields
         try:
@@ -264,7 +311,13 @@ class IXBRLDocument:
 
         return row
 
-    def _text_fact_to_row(self, fact: TextFact, section_title: str) -> Dict[str, Any]:
+    def _text_fact_to_row(
+        self,
+        fact: TextFact,
+        section_title: str,
+        filing_date: Optional[Any] = None,
+        report_date: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """Converts a NonNumericFact to a dictionary row conforming to text schema."""
         # 1. Initialize row with None for all target keys
         text_target_keys = list(TARGET_SCHEMA_TEXT_POLARS.keys())
@@ -278,50 +331,66 @@ class IXBRLDocument:
             if key in row:
                 row[key] = value
 
+        # Add filing dates if provided
+        if "filing_date" in row:
+            row["filing_date"] = filing_date
+        if "report_date" in row:
+            row["report_date"] = report_date
+
         # 4. Populate Text Specific Fields
         if "fact_value" in row:
             row["fact_value"] = str(fact.value) if fact.value is not None else None
 
         return row
 
-    def to_numeric_dataframe(self) -> pl.DataFrame:
+    def to_numeric_dataframe(
+        self, filing_date: Optional[Any] = None, report_date: Optional[Any] = None
+    ) -> pl.DataFrame:
         """Creates a DataFrame of only the NumericFacts."""
         rows = []
-        # target_keys removed from _numeric_fact_to_row call
+        numeric_schema = {**TARGET_SCHEMA_NUMERIC_POLARS, "ticker": pl.Utf8}
+
         for section in self.sections:
             for part in section.parts:
                 if part.type == PartType.FACT and isinstance(part.content, NumericFact):
                     fact = cast(NumericFact, part.content)
-                    # Call without target_keys
-                    row = self._numeric_fact_to_row(fact, section.title)
+                    row = self._numeric_fact_to_row(
+                        fact, section.title, filing_date, report_date
+                    )
                     rows.append(row)
 
-        # Create with the specific schema
+        # Create with the specific schema (including ticker)
         try:
+            # We add ticker later in process_filing_urls, schema here should match _row output
             df = pl.DataFrame(rows, schema=TARGET_SCHEMA_NUMERIC_POLARS, strict=False)
         except Exception as e:
-            logging.error(f"Failed to create numeric DataFrame: {e}")
+            logger.error(f"Failed to create numeric DataFrame: {e}")
             df = pl.DataFrame(schema=TARGET_SCHEMA_NUMERIC_POLARS)  # Empty fallback
         return df
 
-    def to_text_dataframe(self) -> pl.DataFrame:
+    def to_text_dataframe(
+        self, filing_date: Optional[Any] = None, report_date: Optional[Any] = None
+    ) -> pl.DataFrame:
         """Creates a DataFrame of only the TextFacts."""
         rows = []
-        # target_keys removed from _text_fact_to_row call
+        text_schema = {**TARGET_SCHEMA_TEXT_POLARS, "ticker": pl.Utf8}
+
         for section in self.sections:
             for part in section.parts:
                 if part.type == PartType.FACT and not isinstance(
                     part.content, NumericFact
                 ):
                     fact = cast(TextFact, part.content)
-                    # Call without target_keys
-                    row = self._text_fact_to_row(fact, section.title)
+                    row = self._text_fact_to_row(
+                        fact, section.title, filing_date, report_date
+                    )
                     rows.append(row)
-        # Create with the specific schema
+        # Create with the specific schema (including ticker)
         try:
+            # We add ticker later in process_filing_urls, schema here should match _row output
             df = pl.DataFrame(rows, schema=TARGET_SCHEMA_TEXT_POLARS, strict=False)
         except Exception as e:
-            logging.error(f"Failed to create text DataFrame: {e}")
+            logger.error(f"Failed to create text DataFrame: {e}")
             df = pl.DataFrame(schema=TARGET_SCHEMA_TEXT_POLARS)  # Empty fallback
         return df
 
@@ -343,22 +412,36 @@ class IXBRLDocumentParser:
                     f"Cached file not found at {instance_path} for URL {xbrl_instance.instance_url}"
                 )
         except Exception as e:
-            logging.error(
+            logger.error(
                 f"Failed to get cache path for {xbrl_instance.instance_url}: {e}"
             )
             return IXBRLDocument(sections=[])
 
-        facts = extract_us_gaap_facts(xbrl_instance)
+        logger.info(
+            f"[IXBRLDocumentParser.parse] Calling extract_us_gaap_facts for {xbrl_instance.instance_url}"
+        )
+        # facts = extract_us_gaap_facts(xbrl_instance)
+        # Keep ALL facts from the instance, not just US-GAAP
+        facts = xbrl_instance.facts
+        logger.info(
+            f"[IXBRLDocumentParser.parse] Using {len(facts)} total facts from instance."
+        )
         self.facts_by_id: Dict[str, AbstractFact] = {
             fact.xml_id: fact for fact in facts if fact.xml_id
         }
+        # --- DEBUG: Log created fact IDs ---
+        created_fact_ids = list(self.facts_by_id.keys())
+        logger.info(
+            f"[IXBRLDocumentParser.parse] Created facts_by_id with {len(created_fact_ids)} IDs. First 5: {created_fact_ids[:5]}"
+        )
+        # ------------------------------------
 
         try:
             # Assuming default encoding or determine dynamically if needed
             with open(instance_path, "r", encoding="utf-8") as f:
                 content = f.read()
         except Exception as e:
-            logging.error(f"Failed to read cached file {instance_path}: {e}")
+            logger.error(f"Failed to read cached file {instance_path}: {e}")
             return IXBRLDocument(sections=[])
 
         # Try different parsers to find one that works
@@ -367,53 +450,53 @@ class IXBRLDocumentParser:
         working_parser = None
         for parser_name in parsers_to_try:
             try:
-                logging.info(f"Attempting to parse with '{parser_name}'...")
+                logger.info(f"Attempting to parse with '{parser_name}'...")
                 temp_soup = BeautifulSoup(content, parser_name)
                 # Test if it finds namespaced tags and IDs correctly
                 test_tags = temp_soup.find_all(["ix:nonfraction", "ix:nonnumeric"])
                 if test_tags:
-                    logging.info(
+                    logger.info(
                         f"Parser '{parser_name}' found {len(test_tags)} ix:non* tags."
                     )
                     ids_found = [tag.get("id") for tag in test_tags if tag.get("id")]
                     if ids_found:
-                        logging.info(
+                        logger.info(
                             f"Parser '{parser_name}' found {len(ids_found)} tags with IDs. Using this parser."
                         )
-                        logging.debug(
+                        logger.debug(
                             f"Sample IDs found by '{parser_name}': {ids_found[:5]}"
                         )
                         soup = temp_soup
                         working_parser = parser_name
                         break  # Found a working parser
                     else:
-                        logging.warning(
+                        logger.warning(
                             f"Parser '{parser_name}' found ix:non* tags but failed to extract IDs."
                         )
                 else:
                     # Check for lowercase tags as a fallback
                     test_tags_lower = temp_soup.find_all(["nonfraction", "nonnumeric"])
                     if test_tags_lower:
-                        logging.warning(
+                        logger.warning(
                             f"Parser '{parser_name}' did not find namespaced 'ix:non*' tags, but found {len(test_tags_lower)} lowercase tags."
                         )
                     else:
-                        logging.warning(
+                        logger.warning(
                             f"Parser '{parser_name}' did not find any 'ix:non*' or lowercase fact tags."
                         )
 
             except Exception as e:
-                logging.warning(f"Failed to parse or test with '{parser_name}': {e}")
+                logger.warning(f"Failed to parse or test with '{parser_name}': {e}")
 
         if not soup:
-            logging.error(
+            logger.error(
                 "Could not effectively parse HTML with any available parser ('lxml', 'html5lib', 'html.parser'). Ensure parsers are installed."
             )
             return IXBRLDocument(sections=[])
-        logging.info(f"Using HTML parser: '{working_parser}'")
+        logger.info(f"Using HTML parser: '{working_parser}'")
 
         # --- Detailed Debugging ---
-        logging.info("Scanning parsed HTML for fact tags...")
+        logger.info("Scanning parsed HTML for fact tags...")
         facts_found_in_html = 0
         matched_facts_count = 0
         unmatched_ids = []
@@ -421,7 +504,7 @@ class IXBRLDocumentParser:
             facts_found_in_html += 1
             tag_id = tag.get("id")
             tag_name_attr = tag.get("name")  # Get name attribute from HTML tag
-            logging.debug(
+            logger.debug(
                 f"Processing HTML tag: <{tag.name} id='{tag_id}' name='{tag_name_attr}'>"
             )
 
@@ -440,34 +523,34 @@ class IXBRLDocumentParser:
                     # Check for mismatch only if local_tag_name was successfully extracted
                     if local_tag_name is not None:
                         if fact_obj.concept.name != local_tag_name:
-                            logging.warning(
+                            logger.warning(
                                 f"ID MATCH, NAME MISMATCH for id='{tag_id}': HTML name='{tag_name_attr}' (local='{local_tag_name}'), Fact concept.name='{fact_obj.concept.name}'"
                             )
                     elif tag_name_attr:
                         # Log if tag_name_attr exists but didn't have a colon or expected format
-                        logging.debug(
+                        logger.debug(
                             f"ID MATCH, HTML name='{tag_name_attr}' has no prefix or unexpected format. Skipping name comparison."
                         )
                     elif not tag_name_attr:
-                        logging.warning(
+                        logger.warning(
                             f"ID MATCH, but HTML tag id='{tag_id}' is missing the 'name' attribute."
                         )
                 else:
                     unmatched_ids.append(tag_id)
-                    logging.debug(
+                    logger.debug(
                         f"Found tag with id='{tag_id}', but this ID is not in the provided facts dictionary."
                     )
             else:
-                logging.warning(
+                logger.warning(
                     f"Found <{tag.name}> tag without an 'id' attribute: {tag}"
                 )
 
-        logging.info(f"HTML Scan Complete: Found {facts_found_in_html} <ix:non*> tags.")
-        logging.info(
+        logger.info(f"HTML Scan Complete: Found {facts_found_in_html} <ix:non*> tags.")
+        logger.info(
             f"Matched {matched_facts_count} tags to provided facts using the 'id' attribute."
         )
         if unmatched_ids:
-            logging.warning(
+            logger.warning(
                 f"Found {len(unmatched_ids)} tags with IDs that were NOT in the provided facts dictionary. First 5 unmatched: {unmatched_ids[:5]}"
             )
         # --- End Debugging ---
@@ -477,7 +560,7 @@ class IXBRLDocumentParser:
         # Use a more reliable default title or detect from first heading
         body = soup.find("body")
         if not body:
-            logging.error("No <body> tag found in the document.")
+            logger.error("No <body> tag found in the document.")
             return IXBRLDocument(sections=[])
 
         current_section_title = "Document Start"  # Initial default
@@ -500,7 +583,7 @@ class IXBRLDocumentParser:
                 ]
                 text_content = node.strip()
                 if text_content and not parent_is_fact:
-                    logging.debug(f"Adding TEXT part: '{text_content[:50]}...'")
+                    logger.debug(f"Adding TEXT part: '{text_content[:50]}...'")
                     current_parts.append(
                         DocumentPart(type=PartType.TEXT, content=text_content)
                     )
@@ -513,7 +596,7 @@ class IXBRLDocumentParser:
                 if node.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
                     # Save previous section if it has parts AND a title
                     if current_parts:
-                        logging.info(
+                        logger.info(
                             f"Completing section: '{current_section_title}' with {len(current_parts)} parts."
                         )
                         sections.append(
@@ -527,16 +610,21 @@ class IXBRLDocumentParser:
                         node.get_text(strip=True) or f"Untitled Section ({node.name})"
                     )
                     current_parts.clear()  # Clear parts for the new section
-                    logging.debug(f"Starting new section: '{current_section_title}'")
+                    logger.debug(f"Starting new section: '{current_section_title}'")
                     # Don't process children of header, title is enough
                     return
 
                 # Check for facts
                 elif node.name in ["ix:nonfraction", "ix:nonnumeric"]:
                     fact_id = node.get("id")
+                    # --- DEBUG: Log HTML Fact ID ---
+                    logger.info(
+                        f"[process_node] Found HTML fact tag with id: {fact_id}"
+                    )
+                    # --------------------------------
                     if fact_id and fact_id in self.facts_by_id:
                         fact_obj = self.facts_by_id[fact_id]
-                        logging.debug(
+                        logger.debug(
                             f"Adding FACT part: id='{fact_id}', concept='{fact_obj.concept.name}'"
                         )
                         current_parts.append(
@@ -555,12 +643,12 @@ class IXBRLDocumentParser:
                     process_node(child)
 
         # Start processing from body
-        logging.info("Starting recursive processing of document body...")
+        logger.info("Starting recursive processing of document body...")
         process_node(body)
 
         # Add the last section if it has parts
         if current_parts:
-            logging.info(
+            logger.info(
                 f"Completing final section: '{current_section_title}' with {len(current_parts)} parts."
             )
             sections.append(
@@ -569,7 +657,7 @@ class IXBRLDocumentParser:
 
         # Filter out empty sections just in case
         sections = [s for s in sections if s.parts]
-        logging.info(f"Processing complete. Created {len(sections)} sections.")
+        logger.info(f"Processing complete. Created {len(sections)} sections.")
 
         return IXBRLDocument(sections=sections)
 
@@ -583,6 +671,14 @@ def extract_us_gaap_facts(inst: XbrlInstance) -> List[AbstractFact]:
         concept = fact.concept
         if "us-gaap" in concept.schema_url:
             us_gaap_facts.append(fact)
+
+    # Add INFO log
+    logger.info(
+        f"[extract_us_gaap_facts] Extracted {len(inst.facts)} total facts, {len(us_gaap_facts)} US-GAAP facts from instance."
+    )
+    # Log first few kept fact IDs
+    kept_ids = [f.xml_id for f in us_gaap_facts if f.xml_id]
+    logger.info(f"[extract_us_gaap_facts] First 5 kept fact IDs: {kept_ids[:5]}")
 
     return us_gaap_facts
 
@@ -604,7 +700,7 @@ def extract_financial_metrics(
         from xbrl.cache import HttpCache
         from xbrl.instance import XbrlParser, XbrlInstance
     except ImportError:
-        logging.warning(
+        logger.warning(
             "py-xbrl package not installed. Install with: pip install py-xbrl"
         )
         return {"error": "py-xbrl package not installed"}
@@ -743,7 +839,7 @@ def extract_financial_metrics(
                     )
 
                 if df_data:
-                    metrics["summary_df"] = pd.DataFrame(df_data)
+                    metrics["summary_df"] = pl.DataFrame(df_data)
 
                 # Calculate derived metrics if we have detailed financials
                 if ProcessingOptions.DETAILED_FINANCIALS in options:
@@ -777,7 +873,7 @@ def extract_financial_metrics(
                             pass
 
     except Exception as e:
-        logging.error(f"Error processing XBRL: {str(e)}")
+        logger.error(f"Error processing XBRL: {str(e)}")
         metrics["error"] = str(e)
 
     return metrics
@@ -954,7 +1050,6 @@ def process_filing_content(
     full_text: str,
     raw_filing: str,
     options: ProcessingOptions,
-    logger: Optional[logging.Logger] = None,
 ) -> List[Dict[str, Any]]:
     """
     Process the filing content according to the specified options.
@@ -1186,7 +1281,7 @@ def fetch_filing_with_xbrl(
         from xbrl.cache import HttpCache
         from xbrl.instance import XbrlParser
     except ImportError:
-        logging.warning(
+        logger.warning(
             "py-xbrl package not installed. Install with: pip install py-xbrl"
         )
         return {"error": "py-xbrl package not installed"}
@@ -1271,10 +1366,10 @@ def fetch_filing_with_xbrl(
                     result["xbrl_instance"] = xbrl_doc
                     break  # Successfully parsed an XBRL document
                 except Exception as e:
-                    logging.warning(f"Failed to parse XBRL document {xbrl_url}: {e}")
+                    logger.warning(f"Failed to parse XBRL document {xbrl_url}: {e}")
 
     except Exception as e:
-        logging.error(f"Error fetching filing: {str(e)}")
+        logger.error(f"Error fetching filing: {str(e)}")
         result["error"] = str(e)
 
     return result
@@ -1313,7 +1408,7 @@ def extract_text_from_html(html_content: str) -> str:
 
         return text
     except Exception as e:
-        logging.error(f"Error extracting text from HTML: {str(e)}")
+        logger.error(f"Error extracting text from HTML: {str(e)}")
         return html_content  # Return original content if extraction fails
 
 
@@ -1346,81 +1441,498 @@ def save_facts_to_delta(
     df.write.format("delta").mode("append").saveAsTable(table_name)
 
 
-def process_filing_urls(filings_df: pl.DataFrame) -> Tuple[pl.DataFrame, pl.DataFrame]:
+def process_filing_urls_structured(
+    filings_df: pl.DataFrame,
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """
-    Processes a list of XBRL filing URLs, extracts numeric and text facts,
+    Processes a list of XBRL filing URLs, parses the HTML structure,
+    extracts numeric and text facts linked to document sections,
     and aggregates them into separate Polars DataFrames.
 
     Args:
-        filing_urls: A list of URLs pointing to XBRL instance documents.
-        cache: An initialized HttpCache object for fetching and caching files.
+        filings_df: DataFrame containing 'ticker', 'xbrl_instance_url',
+                    'filingDate', and 'reportDate' columns.
 
     Returns:
         A tuple containing two Polars DataFrames:
-        1. Aggregated numeric facts DataFrame.
-        2. Aggregated text facts DataFrame.
+        1. Aggregated numeric facts DataFrame (schema includes ticker, dates, section_name).
+        2. Aggregated text facts DataFrame (schema includes ticker, dates, section_name).
     """
     from xbrl.cache import HttpCache
+    from xbrl.instance import XbrlParser
 
+    logger.info("[process_filing_urls_structured] Starting structured fact extraction.")
     cache = HttpCache(cache_dir="./cache")
 
-    all_numeric_facts_df = pl.DataFrame(schema=TARGET_SCHEMA_NUMERIC_POLARS)
-    all_text_facts_df = pl.DataFrame(schema=TARGET_SCHEMA_TEXT_POLARS)
+    # Use the original schemas that include section_name
+    numeric_schema_structured_with_ticker = {
+        **TARGET_SCHEMA_NUMERIC_POLARS,
+        "ticker": pl.Utf8,
+    }
+    text_schema_structured_with_ticker = {
+        **TARGET_SCHEMA_TEXT_POLARS,
+        "ticker": pl.Utf8,
+    }
+
+    all_numeric_facts_df = pl.DataFrame(schema=numeric_schema_structured_with_ticker)
+    all_text_facts_df = pl.DataFrame(schema=text_schema_structured_with_ticker)
 
     try:
-        from xbrl.instance import XbrlParser
+        parser = XbrlParser(cache)
+        doc_parser = IXBRLDocumentParser(cache)  # Need the document parser here
     except ImportError:
-        logging.error("py-xbrl package not installed. Run: pip install py-xbrl")
-        return all_numeric_facts_df, all_text_facts_df  # Return empty DFs
+        logger.error("py-xbrl package not installed. Run: pip install py-xbrl")
+        return all_numeric_facts_df, all_text_facts_df
 
-    parser = XbrlParser(cache)
-    doc_parser = IXBRLDocumentParser(cache)
+    # Check input columns
+    # Use the _dt columns for dates
+    expected_input_cols = {
+        "ticker",
+        "xbrl_instance_url",
+        "filing_date_dt",
+        "report_date_dt",
+    }
+    if not expected_input_cols.issubset(filings_df.columns):
+        logger.error(
+            f"[process_filing_urls_structured] Input DataFrame missing expected columns. Need: {expected_input_cols}, Got: {filings_df.columns}. Returning empty DataFrames."
+        )
+        return all_numeric_facts_df, all_text_facts_df
 
+    processed_count = 0
     for record in filings_df.iter_rows(named=True):
-        url = record["xbrl_instance_url"]
+        url = record.get("xbrl_instance_url")
+        ticker = record.get("ticker")
+        # Extract dates using the _dt columns
+        filing_date = record.get("filing_date_dt")
+        report_date = record.get("report_date_dt")
+
+        if not url or not ticker:
+            logger.warning(
+                f"[structured] Skipping record due to missing URL or Ticker: {record}"
+            )
+            continue
+
         try:
+            # 1. Parse the XBRL instance
             inst = parser.parse_instance(url)
             if not inst:
-                logging.warning(f"Skipping {url}: Instance parsing failed.")
+                logger.warning(
+                    f"[structured] Skipping {url} (Ticker: {ticker}): Instance parsing failed."
+                )
                 continue
 
-            # Parse the document structure
+            # 2. Parse the HTML document structure using the instance
+            # This is the key difference: uses IXBRLDocumentParser
             document = doc_parser.parse(xbrl_instance=inst)
 
-            # Create the two separate DataFrames
-            numeric_df = document.to_numeric_dataframe()
-            text_df = document.to_text_dataframe()
+            # 3. Create DataFrames from the parsed document structure
+            numeric_df = document.to_numeric_dataframe(
+                filing_date=filing_date, report_date=report_date
+            )
+            text_df = document.to_text_dataframe(
+                filing_date=filing_date, report_date=report_date
+            )
 
-            # Concatenate into respective accumulators
+            # 4. Add ticker column before concatenating
+            if not numeric_df.is_empty():
+                numeric_df = numeric_df.with_columns(pl.lit(ticker).alias("ticker"))
+            if not text_df.is_empty():
+                text_df = text_df.with_columns(pl.lit(ticker).alias("ticker"))
+
+            # 5. Concatenate into respective accumulators
             if not numeric_df.is_empty():
                 all_numeric_facts_df = pl.concat(
-                    [all_numeric_facts_df, numeric_df], how="vertical"
+                    [all_numeric_facts_df, numeric_df], how="vertical_relaxed"
                 )
             if not text_df.is_empty():
                 all_text_facts_df = pl.concat(
-                    [all_text_facts_df, text_df], how="vertical"
+                    [all_text_facts_df, text_df], how="vertical_relaxed"
                 )
 
-        except Exception as e:
-            logging.error(f"ERROR processing {url}: {e}")
-            # Optionally include traceback for detailed debugging
-            # import traceback
-            # traceback.print_exc()
+            processed_count += 1
 
-    logging.info("Processing complete.")
-    logging.info(f"Final Numeric DF shape: {all_numeric_facts_df.shape}")
-    logging.info(f"Final Text DF shape: {all_text_facts_df.shape}")
+        except Exception as e:
+            logger.error(
+                f"[structured] ERROR processing {url} (Ticker: {ticker}): {e}",
+                exc_info=True,
+            )
+            # Continue to next filing
+
+    logger.info(
+        f"[process_filing_urls_structured] Processing complete. Processed {processed_count} filings."
+    )
+    logger.info(f"[structured] Final Numeric DF shape: {all_numeric_facts_df.shape}")
+    logger.info(f"[structured] Final Text DF shape: {all_text_facts_df.shape}")
+
+    return all_numeric_facts_df, all_text_facts_df
+
+
+def process_filing_urls_direct(
+    filings_df: pl.DataFrame,
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    """
+    Processes a list of XBRL filing URLs, extracts numeric and text facts
+    directly from the parsed XBRL instance (bypassing HTML structure),
+    and aggregates them into separate Polars DataFrames.
+
+    Args:
+        filings_df: DataFrame containing 'ticker', 'xbrl_instance_url',
+                    'filingDate', and 'reportDate' columns.
+
+    Returns:
+        A tuple containing two Polars DataFrames:
+        1. Aggregated numeric facts DataFrame (schema includes ticker, dates, NO section_name).
+        2. Aggregated text facts DataFrame (schema includes ticker, dates, NO section_name).
+    """
+    from xbrl.cache import HttpCache
+    from xbrl.instance import XbrlParser
+
+    logger.info("[process_filing_urls_direct] Starting direct fact extraction.")
+    cache = HttpCache(cache_dir="./cache")
+
+    # Use the DIRECT schemas (no section_name)
+    numeric_schema_direct_with_ticker = {
+        **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
+        "ticker": pl.Utf8,
+    }
+    text_schema_direct_with_ticker = {
+        **TARGET_SCHEMA_TEXT_DIRECT_POLARS,
+        "ticker": pl.Utf8,
+    }
+
+    all_numeric_facts_df = pl.DataFrame(schema=numeric_schema_direct_with_ticker)
+    all_text_facts_df = pl.DataFrame(schema=text_schema_direct_with_ticker)
+
+    try:
+        parser = XbrlParser(cache)
+    except ImportError:
+        logger.error("py-xbrl package not installed. Run: pip install py-xbrl")
+        return all_numeric_facts_df, all_text_facts_df  # Return empty DFs
+
+    # Check input columns
+    # Use the _dt columns for dates
+    expected_input_cols = {
+        "ticker",
+        "xbrl_instance_url",
+        "filing_date_dt",
+        "report_date_dt",
+    }
+    if not expected_input_cols.issubset(filings_df.columns):
+        logger.error(
+            f"[process_filing_urls_direct] Input DataFrame missing expected columns. Need: {expected_input_cols}, Got: {filings_df.columns}. Returning empty DataFrames."
+        )
+        return all_numeric_facts_df, all_text_facts_df
+
+    processed_count = 0
+    for record in filings_df.iter_rows(named=True):
+        url = record.get("xbrl_instance_url")
+        ticker = record.get("ticker")
+        # Extract dates using the _dt columns
+        filing_date = record.get("filing_date_dt")
+        report_date = record.get("report_date_dt")
+
+        if not url or not ticker:
+            logger.warning(
+                f"[direct] Skipping record due to missing URL or Ticker: {record}"
+            )
+            continue
+
+        try:
+            # 1. Parse the XBRL instance
+            inst = parser.parse_instance(url)
+            if not inst:
+                logger.warning(
+                    f"[direct] Skipping {url} (Ticker: {ticker}): Instance parsing failed."
+                )
+                continue
+
+            # 2. Extract facts directly from the instance using the new helper
+            numeric_df, text_df = extract_facts_from_instance(
+                inst, filing_date=filing_date, report_date=report_date
+            )
+
+            # 3. Add ticker column before concatenating
+            if not numeric_df.is_empty():
+                numeric_df = numeric_df.with_columns(pl.lit(ticker).alias("ticker"))
+            if not text_df.is_empty():
+                text_df = text_df.with_columns(pl.lit(ticker).alias("ticker"))
+
+            # 4. Concatenate into respective accumulators
+            if not numeric_df.is_empty():
+                all_numeric_facts_df = pl.concat(
+                    [all_numeric_facts_df, numeric_df], how="vertical_relaxed"
+                )
+            if not text_df.is_empty():
+                all_text_facts_df = pl.concat(
+                    [all_text_facts_df, text_df], how="vertical_relaxed"
+                )
+
+            processed_count += 1
+
+        except Exception as e:
+            logger.error(
+                f"[direct] ERROR processing {url} (Ticker: {ticker}): {e}",
+                exc_info=True,
+            )
+            # Continue to next filing
+
+    logger.info(
+        f"[process_filing_urls_direct] Processing complete. Processed {processed_count} filings."
+    )
+    logger.info(f"[direct] Final Numeric DF shape: {all_numeric_facts_df.shape}")
+    logger.info(f"[direct] Final Text DF shape: {all_text_facts_df.shape}")
 
     return all_numeric_facts_df, all_text_facts_df
 
 
 if __name__ == "__main__":
+    # Note: This example usage might need adjustment depending on how Universe evolves.
+    # It currently assumes a direct call to get_filings() and then processing.
+    # The new Universe pattern would likely involve get_numeric_facts().
     from alphaledger.universe import Universe
     from alphaledger.config import settings
 
-    universe = Universe(settings.universe_name)
-    filings_df = universe.get_filings()
+    # Use basicConfig for simplicity in example, or configure logger as needed
+    import logging
 
-    numeric_df, text_df = process_filing_urls(filings_df)
-    numeric_df.write_delta(settings.output_dir / "numeric_facts")
-    text_df.write_delta(settings.output_dir / "text_facts")
+    logging.basicConfig(level=logging.INFO)
+    # logger = get_logger(__name__) # Use project's logger if available
+
+    try:
+        # Example: Use a specific universe name defined in your settings or environment
+        universe_name = settings.universe_name  # Or replace with "your_universe_name"
+        logger.info(f"Loading universe: {universe_name}")
+        universe = Universe(universe_name)
+
+        # Ensure metadata is available
+        logger.info("Ensuring filings metadata is available...")
+        universe.ensure_filings_available()
+
+        # Get the filings metadata DataFrame (required input for processing functions)
+        filings_lf = universe.get_filings_lazy()
+        if filings_lf is None:
+            logger.error("Failed to get filings metadata LazyFrame. Cannot proceed.")
+        else:
+            logger.info("Collecting filings metadata...")
+            # Select columns needed by both direct and structured methods
+            required_cols = ["ticker", "xbrl_instance_url", "filingDate", "reportDate"]
+            if not all(col in filings_lf.columns for col in required_cols):
+                logger.error(
+                    f"Filings metadata missing required columns. Need: {required_cols}, Have: {filings_lf.columns}"
+                )
+            else:
+                filings_df = filings_lf.select(required_cols).collect()
+
+                if filings_df.is_empty():
+                    logger.warning(
+                        "No filings metadata found for the universe. No facts to process."
+                    )
+                else:
+                    # --- Choose which processing method to run ---
+                    PROCESS_METHOD = "direct"  # or "structured"
+
+                    logger.info(
+                        f"Processing {len(filings_df)} filings using '{PROCESS_METHOD}' method..."
+                    )
+
+                    if PROCESS_METHOD == "direct":
+                        numeric_df, text_df = process_filing_urls_direct(filings_df)
+                        # Define output paths for direct facts
+                        numeric_path = (
+                            settings.output_dir
+                            / f"{universe.name}_numeric_facts_direct.delta"
+                        )
+                        text_path = (
+                            settings.output_dir
+                            / f"{universe.name}_text_facts_direct.delta"
+                        )
+                    else:  # structured
+                        numeric_df, text_df = process_filing_urls_structured(filings_df)
+                        # Define output paths for structured facts
+                        numeric_path = (
+                            settings.output_dir
+                            / f"{universe.name}_numeric_facts_structured.delta"
+                        )
+                        text_path = (
+                            settings.output_dir
+                            / f"{universe.name}_text_facts_structured.delta"
+                        )
+
+                    logger.info(
+                        f"Saving numeric facts ({len(numeric_df)} rows) to {numeric_path}..."
+                    )
+                    numeric_df.write_delta(str(numeric_path), mode="overwrite")
+
+                    logger.info(
+                        f"Saving text facts ({len(text_df)} rows) to {text_path}..."
+                    )
+                    text_df.write_delta(str(text_path), mode="overwrite")
+
+                    logger.info("Processing and saving complete.")
+
+    except FileNotFoundError as e:
+        logger.error(f"Universe definition not found: {e}")
+    except Exception as e:
+        logger.error(
+            f"An error occurred in the main execution block: {e}", exc_info=True
+        )
+
+# --- Direct Fact Row Conversion Helpers (No Section Title) ---
+
+
+def _direct_fact_to_row(fact: AbstractFact) -> Dict[str, Any]:
+    """Converts any fact to a dictionary row with common fields (excluding section)."""
+    row_base = {}
+    # Basic Info
+    row_base["concept_name"] = fact.concept.name
+    row_base["concept_namespace"] = fact.concept.schema_url.split("/")[-2]
+    row_base["fact_type"] = type(fact).__name__
+
+    context = getattr(fact, "context", None)
+    period_instant = None
+    period_start = None
+    period_end = None
+
+    if context:
+        from xbrl.instance import (
+            InstantContext,
+            TimeFrameContext,
+        )  # Lazy import for type checking
+
+        if isinstance(context, InstantContext):
+            period_instant = getattr(context, "instant_date", None)
+            logger.info(
+                f"[_direct_fact_to_row] Fact {fact.concept.name}: Found InstantContext - Instant: {period_instant} (Type: {type(period_instant)})"
+            )
+        elif isinstance(context, TimeFrameContext):
+            period_start = getattr(context, "start_date", None)
+            period_end = getattr(context, "end_date", None)
+
+        else:
+            # Could be ForeverContext or other AbstractContext subclass
+            pass
+    else:
+        # No context object found on fact
+        pass
+
+    # Assign extracted dates (or None) to the row
+    row_base["period_instant"] = period_instant
+    row_base["period_start"] = period_start
+    row_base["period_end"] = period_end
+
+    return row_base
+
+
+def _direct_numeric_fact_to_row(
+    fact: NumericFact,
+    filing_date: Optional[Any] = None,
+    report_date: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Converts a NumericFact directly to a dictionary row conforming to direct numeric schema."""
+    numeric_target_keys = list(TARGET_SCHEMA_NUMERIC_DIRECT_POLARS.keys())
+    row = {key: None for key in numeric_target_keys}
+    common_fields = _direct_fact_to_row(fact)
+
+    for key, value in common_fields.items():
+        if key in row:
+            row[key] = value
+
+    # Add filing dates
+    row["filing_date"] = filing_date
+    row["report_date"] = report_date
+
+    # Populate Numeric Specific Fields
+    try:
+        row["fact_value"] = float(fact.value) if fact.value is not None else None
+    except (ValueError, TypeError):
+        row["fact_value"] = None
+
+    unit = getattr(fact, "unit", None)
+    row["unit"] = str(unit) if unit else None
+
+    metadata_dict = {"decimals": None, "precision": None}
+    decimals = getattr(fact, "decimals", None)
+    precision = getattr(fact, "precision", None)
+    try:
+        metadata_dict["decimals"] = int(decimals) if decimals is not None else None
+    except:
+        pass
+    try:
+        metadata_dict["precision"] = int(precision) if precision is not None else None
+    except:
+        pass
+    row["metadata"] = metadata_dict
+
+    return row
+
+
+def _direct_text_fact_to_row(
+    fact: TextFact,
+    filing_date: Optional[Any] = None,
+    report_date: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Converts a TextFact directly to a dictionary row conforming to direct text schema."""
+    text_target_keys = list(TARGET_SCHEMA_TEXT_DIRECT_POLARS.keys())
+    row = {key: None for key in text_target_keys}
+    common_fields = _direct_fact_to_row(fact)
+
+    for key, value in common_fields.items():
+        if key in row:
+            row[key] = value
+
+    # Add filing dates
+    row["filing_date"] = filing_date
+    row["report_date"] = report_date
+
+    # Populate Text Specific Fields
+    row["fact_value"] = str(fact.value) if fact.value is not None else None
+
+    return row
+
+
+def extract_facts_from_instance(
+    instance: XbrlInstance,
+    filing_date: Optional[Any] = None,
+    report_date: Optional[Any] = None,
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    """
+    Extracts numeric and text facts directly from an XbrlInstance object,
+    bypassing HTML document parsing.
+
+    Args:
+        instance: The parsed XbrlInstance object.
+        filing_date: Optional filing date to associate with the facts.
+        report_date: Optional report date to associate with the facts.
+
+    Returns:
+        A tuple containing two Polars DataFrames:
+        1. Numeric facts DataFrame (schema: TARGET_SCHEMA_NUMERIC_DIRECT_POLARS).
+        2. Text facts DataFrame (schema: TARGET_SCHEMA_TEXT_DIRECT_POLARS).
+    """
+    numeric_rows = []
+    text_rows = []
+
+    # Optional: Filter facts here if needed (e.g., for US-GAAP only)
+    facts_to_process = instance.facts
+    # To filter for US-GAAP:
+    # facts_to_process = [f for f in instance.facts if "us-gaap" in f.concept.schema_url]
+
+    for fact in facts_to_process:
+        if isinstance(fact, NumericFact):
+            row = _direct_numeric_fact_to_row(fact, filing_date, report_date)
+            numeric_rows.append(row)
+        elif isinstance(fact, TextFact):  # Or just else? Assuming AbstractFact is base
+            row = _direct_text_fact_to_row(fact, filing_date, report_date)
+            text_rows.append(row)
+        # else: # Handle other potential AbstractFact types if necessary
+        #     logger.debug(f"Skipping fact of unhandled type: {type(fact)}")
+
+    # Create DataFrames using the direct schemas
+    numeric_df = pl.DataFrame(
+        numeric_rows, schema=TARGET_SCHEMA_NUMERIC_DIRECT_POLARS, strict=False
+    )
+    text_df = pl.DataFrame(
+        text_rows, schema=TARGET_SCHEMA_TEXT_DIRECT_POLARS, strict=False
+    )
+
+    return numeric_df, text_df
