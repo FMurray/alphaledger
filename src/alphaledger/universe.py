@@ -14,7 +14,8 @@ from unittest.mock import MagicMock
 from alphaledger.sec import EDGARFetcher, load_ticker_to_cik_mapping
 from alphaledger import get_logger
 from alphaledger.process_xbrl import (
-    process_filings_structured,
+    process_filings_structured_direct,
+    # process_filings_structured_sections,
     TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
     TARGET_SCHEMA_NUMERIC_POLARS,
 )
@@ -29,6 +30,27 @@ logger = get_logger(__name__)
 # --- Constants ---
 EARLIEST_YEAR_PLACEHOLDER = 1995  # Placeholder for "earliest" in range calculations
 DEFAULT_YEAR_RANGE = 10  # Default lookback if start_year is None
+
+# Define the expected schema for the filings metadata DataFrame
+# This should match the output of EDGARFetcher.search_10k_filings + processed_datetime
+TARGET_METADATA_SCHEMA = {
+    "ticker": pl.Utf8,
+    "cik": pl.Utf8,
+    "form": pl.Utf8,
+    "accessionNumber": pl.Utf8,
+    "filingDate": pl.Utf8,  # String from SEC initially
+    "filing_date_dt": pl.Date,  # Derived date type
+    "filing_year": pl.Int64,  # Derived year
+    "reportDate": pl.Utf8,  # String from SEC initially
+    "report_date_dt": pl.Date,  # Derived date type
+    "primaryDocument": pl.Utf8,
+    "primaryDocDescription": pl.Utf8,
+    "documents_url": pl.Utf8,  # Derived URL
+    "xbrl_instance_url": pl.Utf8,  # Derived URL
+    "processed_datetime": pl.Datetime(
+        time_unit="us", time_zone=None
+    ),  # Added by fetcher
+}
 
 
 class YearRange(BaseModel):
@@ -152,25 +174,32 @@ class Universe:
         start_year: Union[int, Literal["earliest"], None] = None,
         end_year: Union[int, Literal["latest"], None] = None,
         file_format: str = DEFAULT_FILE_FORMAT,
+        empty: bool = False,
     ):
         """
-        Initializes the Universe by loading its definition from a file and
-        setting up a lazy reference to its filings *metadata* file if it exists.
+        Initializes the Universe.
+        If empty=True, creates an in-memory universe without loading from a definition file.
+        Otherwise, loads its definition from a file and sets up a lazy reference
+        to its filings *metadata* file if it exists.
 
         Args:
             universe_name_or_path: The name (e.g., "my_universe", "sectors/cloud")
-                or full path to the definition file (.yaml or .json).
+                or full path to the definition file (.yaml or .json) if empty=False.
+                If empty=True, this is used as the universe name.
             start_year: Optional start year for the analysis period.
             end_year: Optional end year for the analysis period.
             file_format: The expected format of the filings *metadata* file ('delta', 'parquet', 'csv').
+            empty: If True, creates an empty universe in memory. Defaults to False.
 
         Raises:
-            FileNotFoundError: If the definition file cannot be found.
+            FileNotFoundError: If empty=False and the definition file cannot be found.
             ValueError: If the loaded definition is invalid.
         """
         self.raw_name: str = universe_name_or_path
-        self.name: str
-        self.definition_path: Path
+        self.name: str = self._normalize_name(
+            universe_name_or_path
+        )  # Normalize name early
+        self.definition_path: Optional[Path] = None  # Initialize
         self.securities: Dict[str, Security] = {}
         self.year_range = YearRange(start=start_year, end=end_year)
         self.filings_lf: Optional[pl.LazyFrame] = (
@@ -179,8 +208,17 @@ class Universe:
         self._fetcher: Optional[EDGARFetcher] = None
         self.file_format = file_format  # Store the format
 
-        # Eagerly load definition (populates self.name, self.securities, etc.)
-        self._load_definition(universe_name_or_path)
+        if not empty:
+            # Eagerly load definition (populates self.name, self.securities, etc.)
+            # _load_definition also sets self.raw_name and self.name if a 'name' field is in the file
+            self._load_definition(universe_name_or_path)
+        else:
+            logger.info(
+                f"Creating an empty universe named '{self.name}' (raw: '{self.raw_name}'). No definition file will be loaded."
+            )
+            # For an empty universe, self.name is already set from universe_name_or_path
+            # self.raw_name is also already set
+            # self.definition_path remains None
 
         # Determine filings metadata path based on loaded/normalized name
         filings_path = self._get_filings_path(self.file_format)
@@ -502,7 +540,7 @@ class Universe:
                         f"Failed to scan presumably complete metadata file {filings_path}: {e}",
                         exc_info=True,
                     )
-            return  # Exit if complete
+            return self.filings_lf
 
         logger.info(
             f"Found {len(missing_combinations)} missing filing metadata combinations to fetch for {self.get_tickers()} years {self.get_filing_years()}."
@@ -564,9 +602,19 @@ class Universe:
                         f"Failed to collect existing metadata from LazyFrame for '{self.name}': {e}. Proceeding with fetched data only.",
                         exc_info=True,
                     )
-                    existing_df = pl.DataFrame()
+                    # Initialize with the correct schema if collection fails
+                    existing_df = pl.DataFrame(schema=TARGET_METADATA_SCHEMA)
             else:
-                existing_df = pl.DataFrame()
+                # Initialize with the correct schema if LazyFrame exists but no data
+                existing_df = pl.DataFrame(schema=TARGET_METADATA_SCHEMA)
+
+            # Add more detailed schema logging here
+            logger.info(f"Detailed Schema - existing_df: {existing_df.schema}")
+            logger.debug(f"Schema of missing_metadata_df: {missing_metadata_df.schema}")
+            logger.debug(f"Columns in existing_df: {existing_df.columns}")
+            logger.debug(
+                f"Columns in missing_metadata_df: {missing_metadata_df.columns}"
+            )
 
             logger.info(
                 f"Combining {len(existing_df)} existing metadata rows with {len(missing_metadata_df)} newly fetched metadata rows."
@@ -628,6 +676,7 @@ class Universe:
         logger.info(
             f"Filings metadata availability check/update finished for '{self.name}'. {status}"
         )
+        return self.filings_lf
 
     def _save_filings_df(self, df: pl.DataFrame, path: Path, file_format: str):
         """Helper to save the filings *metadata* dataframe."""
@@ -674,6 +723,38 @@ class Universe:
             )
         return self.filings_lf
 
+    # --- Security Management ---
+    def add_security(self, security: Security) -> None:
+        """Adds a security to the universe.
+
+        Args:
+            security: The Security object to add.
+        """
+        if not isinstance(security, Security):
+            logger.error(f"Attempted to add non-Security object: {security}")
+            raise TypeError("Only Security objects can be added to a Universe.")
+
+        if security.ticker in self.securities:
+            logger.warning(
+                f"Security with ticker '{security.ticker}' already exists in universe '{self.name}'. Overwriting."
+            )
+        self.securities[security.ticker] = security
+        logger.debug(f"Added security {security.ticker} to universe '{self.name}'.")
+
+    def remove_security(self, ticker: str) -> None:
+        """Removes a security from the universe by its ticker.
+
+        Args:
+            ticker: The ticker symbol of the security to remove.
+        """
+        if ticker in self.securities:
+            del self.securities[ticker]
+            logger.debug(f"Removed security {ticker} from universe '{self.name}'.")
+        else:
+            logger.warning(
+                f"Attempted to remove non-existent security ticker '{ticker}' from universe '{self.name}'."
+            )
+
     # --- Basic Accessors ---
     def get_security(self, ticker: str) -> Optional[Security]:
         """Get a security by ticker."""
@@ -716,50 +797,42 @@ class Universe:
         """
         Lazily retrieves numeric facts for the entire universe.
 
-        Checks a local cache path first (e.g., output/numeric_facts/universe_name.delta).
-        If facts are not cached, it ensures filings metadata is available,
-        processes all XBRL filings for the universe, saves the combined results
-        to the cache, and then returns a LazyFrame pointing to the cache.
-
-        Returns:
-            A Polars LazyFrame pointing to the universe's numeric facts data.
-            Returns None if the essential filings metadata (`filings_lf`) cannot be
-            obtained (e.g., after running collect_filings).
-            Returns an empty LazyFrame if no filings are found or processing fails.
+        If the data file exists but only contains facts for a subset of tickers (e.g., just one),
+        this method will regenerate the data file for the full universe.
+        Returns a LazyFrame for all tickers in the universe.
         """
         numeric_facts_path = self._get_numeric_facts_path()
 
-        # 1. Check cache
+        # 1. Check data file
         if numeric_facts_path.exists() and numeric_facts_path.is_dir():
             logger.info(
-                f"Cache hit: Found existing numeric facts for universe '{self.name}' at {numeric_facts_path}. Returning LazyFrame."
+                f"Data file found: Existing numeric facts for universe '{self.name}' at {numeric_facts_path}. Returning LazyFrame."
             )
             try:
                 lf = pl.scan_delta(str(numeric_facts_path))
-                # Simple check: does it have expected columns?
-                # Use the DIRECT schema for checking now (no section_name)
-                expected_cols = set(TARGET_SCHEMA_NUMERIC_DIRECT_POLARS.keys())
-                expected_cols.add("ticker")  # Ticker should be present
-                expected_cols.update(["filing_date", "report_date"])
-                if expected_cols.issubset(lf.columns):
+                # Check if all tickers are present in the data file
+                cached_tickers = set(
+                    lf.select(pl.col("ticker")).collect()["ticker"].unique()
+                )
+                expected_tickers = set(self.get_tickers())
+                if cached_tickers == expected_tickers:
                     return lf
                 else:
                     logger.warning(
-                        f"Cached file {numeric_facts_path} has unexpected schema ({lf.columns}). Expected {expected_cols}. Will regenerate."
+                        f"Numeric facts data file at {numeric_facts_path} only contains tickers {cached_tickers}, expected {expected_tickers}. Will regenerate for full universe."
                     )
             except Exception as e:
                 logger.error(
-                    f"Error scanning cached delta table for universe '{self.name}' at {numeric_facts_path}: {e}. Will attempt to regenerate.",
+                    f"Error scanning numeric facts data file for universe '{self.name}' at {numeric_facts_path}: {e}. Will attempt to regenerate.",
                     exc_info=True,
                 )
                 # If scanning fails or schema mismatch, proceed to regenerate
         else:
             logger.info(
-                f"Cache miss: No cached numeric facts found for universe '{self.name}' at {numeric_facts_path}. Processing required."
+                f"Data file not found: No numeric facts found for universe '{self.name}' at {numeric_facts_path}. Processing required."
             )
 
         # 2. Ensure filings metadata is available (essential for processing)
-        # Use get_filings_lazy which returns None if not available
         filings_lf = self.get_filings_lazy()
         if filings_lf is None:
             logger.warning(
@@ -769,36 +842,58 @@ class Universe:
             # Cannot proceed without metadata
             return None
 
-        logger.info(f"Processing numeric facts for universe '{self.name}'...")
+        logger.info(
+            f"Processing numeric facts for universe '{self.name}' using direct method..."
+        )
 
         # 3. Collect *all* necessary filing metadata for the universe
         try:
-            # Select only needed columns for efficiency, including dates
-            required_cols = [
+            required_cols_in_filings_lf = [
                 "ticker",
                 "xbrl_instance_url",
-                "filing_date",
-                "report_date",
+                "filing_date_dt",  # Expect datetime object column
+                "report_date_dt",  # Expect datetime object column
             ]
-            if not all(col in filings_lf.columns for col in required_cols):
+            if not all(
+                col in filings_lf.columns for col in required_cols_in_filings_lf
+            ):
                 logger.error(
-                    f"Filings metadata is missing required columns for fact processing. Needed: {required_cols}. Available: {filings_lf.columns}"
+                    f"Filings metadata is missing required columns for fact processing. "
+                    f"Needed in filings_lf: {required_cols_in_filings_lf}. Available: {filings_lf.columns}"
                 )
-                # Return None because we cannot proceed correctly without dates
                 return None
 
-            universe_filings_df = filings_lf.select(required_cols).collect()
+            universe_filings_df = filings_lf.select(
+                required_cols_in_filings_lf
+            ).collect()
+
+            expected_cols_for_processing = required_cols_in_filings_lf
+            if not all(
+                col in universe_filings_df.columns
+                for col in expected_cols_for_processing
+            ):
+                logger.error(
+                    f"DataFrame for processing is missing columns. "
+                    f"Needed: {expected_cols_for_processing}. Got: {universe_filings_df.columns}"
+                )
+                empty_schema = {
+                    **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
+                    "ticker": pl.Utf8,
+                    "filing_date_dt": pl.Date,  # Match expected name and type
+                    "report_date_dt": pl.Date,  # Match expected name and type
+                }
+                return pl.LazyFrame(schema=empty_schema)
+
         except Exception as e:
             logger.error(
-                f"Error collecting filings metadata for universe '{self.name}': {e}",
+                f"Error during XBRL processing pipeline for universe '{self.name}': {e}",
                 exc_info=True,
             )
-            # Define schema for empty LF, including ticker and dates (use DIRECT schema)
             empty_schema = {
                 **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
                 "ticker": pl.Utf8,
-                "filing_date": pl.Date,
-                "report_date": pl.Date,
+                "filing_date_dt": pl.Date,  # Ensure consistency
+                "report_date_dt": pl.Date,  # Ensure consistency
             }
             return pl.LazyFrame(schema=empty_schema)
 
@@ -806,12 +901,11 @@ class Universe:
             logger.warning(
                 f"No filings metadata found for universe '{self.name}' within the specified year range {self.year_range}."
             )
-            # Create an empty DataFrame with full direct schema and save it to the cache path
             empty_schema = {
                 **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
                 "ticker": pl.Utf8,
-                "filing_date": pl.Date,
-                "report_date": pl.Date,
+                "filing_date_dt": pl.Date,  # Ensure consistency
+                "report_date_dt": pl.Date,  # Ensure consistency
             }
             empty_df = pl.DataFrame(schema=empty_schema)
             try:
@@ -828,31 +922,39 @@ class Universe:
                 return empty_df.lazy()  # Return empty lazy frame anyway
 
         logger.info(
-            f"Found {len(universe_filings_df)} filings for universe '{self.name}'. Processing XBRL..."
+            f"Found {len(universe_filings_df)} filings for universe '{self.name}'. Processing XBRL using direct method..."
         )
 
         # 4. Process all URLs for the universe using the direct method
         try:
-            numeric_facts_df, _ = process_filings_structured(universe_filings_df)
+            numeric_facts_df, _ = process_filings_structured_direct(
+                universe_filings_df, self._get_fetcher()
+            )
             logger.info(
                 f"Successfully processed facts for universe '{self.name}'. Found {len(numeric_facts_df)} total numeric facts."
             )
 
-            # 5. Save the combined DataFrame to cache
+            # 5. Save the combined DataFrame to the data file
             if not numeric_facts_df.is_empty():
-                # Ensure ticker and date columns exist before saving
-                expected_cols = set(TARGET_SCHEMA_NUMERIC_DIRECT_POLARS.keys()).union(
-                    {"ticker", "filing_date", "report_date"}
+                expected_cols_after_processing = set(
+                    TARGET_SCHEMA_NUMERIC_DIRECT_POLARS.keys()
+                ).union(
+                    {
+                        "ticker",
+                        "filing_date",
+                        "report_date",
+                    }
                 )
-                if not expected_cols.issubset(numeric_facts_df.columns):
+                if not expected_cols_after_processing.issubset(
+                    numeric_facts_df.columns
+                ):
                     logger.error(
-                        f"Processed facts DataFrame is missing expected columns. Expected: {expected_cols}. Got: {numeric_facts_df.columns}. Cannot save correctly."
+                        f"Processed facts DataFrame is missing expected columns for saving. Expected subset: {expected_cols_after_processing}. Got: {numeric_facts_df.columns}. Cannot save correctly."
                     )
-                    # Return an empty LF as the result is incomplete.
                     empty_schema = {
                         **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
                         "ticker": pl.Utf8,
-                        "filing_date": pl.Date,
+                        "filing_date": pl.Date,  # For empty schema, align with expected output names
                         "report_date": pl.Date,
                     }
                     return pl.LazyFrame(schema=empty_schema)
@@ -862,7 +964,7 @@ class Universe:
                         str(numeric_facts_path), mode="overwrite"
                     )
                     logger.info(
-                        f"Saved numeric facts for universe '{self.name}' to cache: {numeric_facts_path}"
+                        f"Saved numeric facts for universe '{self.name}' to data file: {numeric_facts_path}"
                     )
                 except Exception as e:
                     logger.error(
@@ -874,11 +976,10 @@ class Universe:
                 logger.warning(
                     f"Processing for universe '{self.name}' yielded no numeric facts. Saving empty placeholder."
                 )
-                # Save empty placeholder if processing resulted in nothing
                 empty_schema = {
                     **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
                     "ticker": pl.Utf8,
-                    "filing_date": pl.Date,
+                    "filing_date": pl.Date,  # Ensure consistency for empty placeholder
                     "report_date": pl.Date,
                 }
                 empty_df = pl.DataFrame(schema=empty_schema)
@@ -890,7 +991,7 @@ class Universe:
                         exc_info=True,
                     )
 
-            # 6. Return LazyFrame pointing to the (newly created) cache
+            # 6. Return LazyFrame pointing to the (newly created) data file
             try:
                 return pl.scan_delta(str(numeric_facts_path))
             except Exception as e:
@@ -898,12 +999,10 @@ class Universe:
                     f"Failed to scan newly created/updated delta table for '{self.name}' at {numeric_facts_path}: {e}. Returning in-memory LF.",
                     exc_info=True,
                 )
-                # Fallback: return the lazy version of the processed DF if scan fails
-                # Ensure expected columns are present in fallback
-                expected_cols = set(TARGET_SCHEMA_NUMERIC_DIRECT_POLARS.keys()).union(
-                    {"ticker", "filing_date", "report_date"}
-                )
-                if not expected_cols.issubset(numeric_facts_df.columns):
+                expected_cols_in_fallback = set(
+                    TARGET_SCHEMA_NUMERIC_DIRECT_POLARS.keys()
+                ).union({"ticker", "filing_date", "report_date"})
+                if not expected_cols_in_fallback.issubset(numeric_facts_df.columns):
                     empty_schema = {
                         **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
                         "ticker": pl.Utf8,
@@ -919,160 +1018,55 @@ class Universe:
                 f"Error during XBRL processing pipeline for universe '{self.name}': {e}",
                 exc_info=True,
             )
-            # Return empty LF if XBRL processing itself failed
             empty_schema = {
                 **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
                 "ticker": pl.Utf8,
-                "filing_date": pl.Date,
+                "filing_date": pl.Date,  # Ensure consistency
                 "report_date": pl.Date,
             }
             return pl.LazyFrame(schema=empty_schema)
 
-    # --- Standalone Load/Save for Definition Files (Optional) ---
-
     def get_security_numeric_facts(self, ticker: str) -> Optional[pl.LazyFrame]:
         """
-        Lazily retrieves numeric facts for a specific security.
-
-        Checks a local cache path first. If facts are not cached,
-        it fetches the required filing metadata, processes the XBRL,
-        saves the results to the cache, and then returns a LazyFrame.
-
-        Args:
-            ticker: The ticker symbol of the security.
-
-        Returns:
-            A Polars LazyFrame pointing to the numeric facts data, or None if the
-            security is not found or initial metadata is missing/unavailable.
-            Returns an empty LazyFrame if no filings are found or processing fails.
+        Lazily retrieves numeric facts for a specific security (ticker).
+        Only processes filings for the requested ticker.
         """
         if ticker not in self.securities:
             logger.error(f"Ticker '{ticker}' not found in universe '{self.name}'.")
             return None
 
-        numeric_facts_path = self._get_numeric_facts_path()
-
-        # 1. Check cache
-        if (
-            numeric_facts_path.exists() and numeric_facts_path.is_dir()
-        ):  # Delta tables are dirs
-            logger.info(
-                f"Cache hit: Found existing numeric facts for {ticker} at {numeric_facts_path}. Returning LazyFrame."
-            )
-            try:
-                return pl.scan_delta(str(numeric_facts_path))
-            except Exception as e:
-                logger.error(
-                    f"Error scanning cached delta table for {ticker} at {numeric_facts_path}: {e}. Will attempt to regenerate.",
-                    exc_info=True,
-                )
-                # If scanning fails, proceed to regenerate
-        else:
-            logger.info(
-                f"Cache miss: No cached numeric facts found for {ticker} at {numeric_facts_path}. Processing required."
-            )
-
-        # 2. Check if filings metadata is available (needed for processing)
-        if self.filings_lf is None:
+        filings_lf = self.get_filings_lazy()
+        if filings_lf is None:
             logger.warning(
-                f"Filings metadata LazyFrame not available for '{self.name}'. "
-                f"Run collect_filings() first. Cannot fetch facts for {ticker}."
+                f"Filings metadata LazyFrame not available for '{self.name}'. Run collect_filings() first."
             )
-            # Cannot proceed without metadata
-            return None  # Return None as we cannot even attempt processing
+            return None
 
-        logger.info(f"Fetching numeric facts for {ticker} in universe '{self.name}'...")
-
-        # 3. Filter metadata for the specific ticker
-        try:
-            ticker_filings_lf = self.filings_lf.filter(pl.col("ticker") == ticker)
-            ticker_filings_df = ticker_filings_lf.collect()
-        except Exception as e:
-            logger.error(
-                f"Error collecting filings metadata for ticker '{ticker}': {e}",
-                exc_info=True,
-            )
-            # Return empty LF as processing failed before XBRL step
-            return pl.LazyFrame(schema=TARGET_SCHEMA_NUMERIC_POLARS)
-
+        # Filter filings to just this ticker
+        ticker_filings_df = filings_lf.filter(pl.col("ticker") == ticker).collect()
         if ticker_filings_df.is_empty():
             logger.warning(
-                f"No filings metadata found for ticker '{ticker}' within the specified year range {self.year_range} for universe '{self.name}'."
+                f"No filings found for ticker '{ticker}' in universe '{self.name}'."
             )
-            # Create an empty DataFrame and save it to the cache path
-            empty_df = pl.DataFrame(schema=TARGET_SCHEMA_NUMERIC_POLARS)
-            try:
-                empty_df.write_delta(str(numeric_facts_path), mode="overwrite")
-                logger.info(
-                    f"Saved empty placeholder for {ticker} facts at {numeric_facts_path}"
-                )
-                return empty_df.lazy()
-            except Exception as e:
-                logger.error(
-                    f"Failed to write empty placeholder delta table for {ticker} at {numeric_facts_path}: {e}",
-                    exc_info=True,
-                )
-                return empty_df.lazy()  # Return empty lazy frame anyway
+            return pl.LazyFrame(
+                schema={
+                    **TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
+                    "ticker": pl.Utf8,
+                    "filing_date": pl.Date,
+                    "report_date": pl.Date,
+                }
+            )
 
-        logger.info(
-            f"Found {len(ticker_filings_df)} filings for {ticker}. Processing XBRL..."
+        # Process only this ticker's filings
+        numeric_facts_df, _ = process_filings_structured_direct(
+            ticker_filings_df, self._get_fetcher()
         )
-
-        # 4. Process the URLs using the function from process_xbrl
-        try:
-            numeric_facts_df, _ = process_filings_structured(ticker_filings_df)
-            logger.info(
-                f"Successfully processed facts for {ticker}. Found {len(numeric_facts_df)} numeric facts."
+        if numeric_facts_df.is_empty():
+            logger.warning(
+                f"No numeric facts found for ticker '{ticker}' in universe '{self.name}'."
             )
-
-            # 5. Save to cache
-            if not numeric_facts_df.is_empty():
-                try:
-                    numeric_facts_df.write_delta(
-                        str(numeric_facts_path), mode="overwrite"
-                    )
-                    logger.info(
-                        f"Saved numeric facts for {ticker} to cache: {numeric_facts_path}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"Failed to write numeric facts delta table for {ticker} to {numeric_facts_path}: {e}",
-                        exc_info=True,
-                    )
-                    # Proceed to return the lazy frame even if saving failed
-            else:
-                logger.warning(
-                    f"Processing for {ticker} yielded no numeric facts. Saving empty placeholder."
-                )
-                # Save empty placeholder if processing resulted in nothing
-                empty_df = pl.DataFrame(schema=TARGET_SCHEMA_NUMERIC_POLARS)
-                try:
-                    empty_df.write_delta(str(numeric_facts_path), mode="overwrite")
-                except Exception as e:
-                    logger.error(
-                        f"Failed to write empty placeholder delta after processing for {ticker}: {e}",
-                        exc_info=True,
-                    )
-
-            # 6. Return LazyFrame pointing to the (newly created) cache
-            # Use scan_delta again to ensure we load exactly what was written (or the empty placeholder)
-            try:
-                return pl.scan_delta(str(numeric_facts_path))
-            except Exception as e:
-                logger.error(
-                    f"Failed to scan newly created/updated delta table for {ticker} at {numeric_facts_path}: {e}. Returning in-memory LF.",
-                    exc_info=True,
-                )
-                # Fallback: return the lazy version of the processed DF if scan fails
-                return numeric_facts_df.lazy()
-
-        except Exception as e:
-            logger.error(
-                f"Error processing XBRL filings for ticker '{ticker}': {e}",
-                exc_info=True,
-            )
-            # Return empty LF if XBRL processing itself failed
-            return pl.LazyFrame(schema=TARGET_SCHEMA_NUMERIC_POLARS)
+            return numeric_facts_df.lazy()
+        return numeric_facts_df.lazy()
 
 
 # --- Standalone Load/Save for Definition Files (Optional) ---

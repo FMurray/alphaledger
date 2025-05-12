@@ -4,7 +4,7 @@ import os
 import json
 import polars as pl
 from bs4 import BeautifulSoup
-from typing import Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Dict, List, Optional, Union, TYPE_CHECKING, Tuple
 from datetime import datetime
 from alphaledger.config import settings
 from alphaledger import get_logger
@@ -50,8 +50,8 @@ def download_ticker_to_cik_mapping(output_path: Optional[str] = None) -> Dict[st
     for line in response.text.strip().split("\n"):
         parts = line.strip().split("\t")
         if len(parts) == 2:
-            ticker, cik = parts
-            mapping[ticker.upper()] = cik.zfill(10)  # Ensure CIK is 10 digits
+            ticker_val, cik_val = parts
+            mapping[ticker_val.upper()] = cik_val.zfill(10)  # Ensure CIK is 10 digits
 
     # Save mapping to file if requested
     if output_path:
@@ -100,12 +100,12 @@ def load_ticker_to_cik_mapping(
     # Filter to just the tickers we need
     result = {}
     missing_tickers = []
-    for ticker in tickers:
-        upper_ticker = ticker.upper()
+    for ticker_sym in tickers:
+        upper_ticker = ticker_sym.upper()
         if upper_ticker in full_mapping:
-            result[ticker] = full_mapping[upper_ticker]
+            result[ticker_sym] = full_mapping[upper_ticker]
         else:
-            missing_tickers.append(ticker)
+            missing_tickers.append(ticker_sym)
 
     if missing_tickers:
         logger.warning(
@@ -113,6 +113,20 @@ def load_ticker_to_cik_mapping(
         )
 
     return result
+
+
+# Define a basic schema for the raw combined data from SEC JSON
+RAW_FILING_SCHEMA = {
+    "accessionNumber": pl.Utf8,
+    "filingDate": pl.Utf8,
+    "reportDate": pl.Utf8,
+    "form": pl.Utf8,
+    "primaryDocument": pl.Utf8,
+    "primaryDocDescription": pl.Utf8,
+    # SEC includes other fields like 'act', 'fileNumber', 'filmNumber', 'items',
+    # 'size', 'isXBRL', 'isInlineXBRL', 'acceptanceDateTime'.
+    # These will be included if present due to strict=False when creating DataFrame.
+}
 
 
 class EDGARFetcher:
@@ -141,386 +155,362 @@ class EDGARFetcher:
         # Convert Path object to string to avoid the endswith() error
         # HttpCache might expect a string path
         cache_dir_str = str(self.cache_dir)
-        self.cache = HttpCache(cache_dir_str)
-        self.cache.set_headers({"User-Agent": self.headers["User-Agent"]})
+        self.http_cache = HttpCache(cache_dir_str)
+        self.http_cache.set_headers({"User-Agent": self.headers["User-Agent"]})
 
-    def get_company_filings(self, cik, custom_url: Optional[str] = None):
+        # Cache for raw combined DataFrames per CIK (cik_formatted -> pl.DataFrame)
+        self._cik_raw_data_store: Dict[str, pl.DataFrame] = {}
+
+        # Revised Cache: Store final filtered results per (CIK, year/range)
+        self._search_results_cache: Dict[
+            Tuple[str, Optional[int], Optional[int], Optional[int]], pl.DataFrame
+        ] = {}
+
+    def _get_json_for_cik_and_url(
+        self, cik_formatted: str, custom_url_part: Optional[str] = None
+    ) -> Optional[Dict]:
         """
-        Get the list of filings for a company using the new SEC submissions API.
-
-        Args:
-            cik (str): The CIK number of the company
-
-        Returns:
-            A dictionary containing the company's filing data
+        Low-level helper to fetch and parse a specific JSON file from SEC for a CIK.
+        Uses HttpCache for network requests.
+        cik_formatted: 10-digit CIK string.
+        custom_url_part: e.g., 'CIKxxxxxxxxxx-submissions-001.json' or None for main CIKxxx.json.
         """
-        # Format CIK with leading zeros to 10 digits
-        cik_formatted = str(cik).zfill(10)
-        if custom_url:
-            base_url = "https://data.sec.gov/submissions"
-            url = f"{base_url}/{custom_url}"
+        if custom_url_part:
+            # Ensure custom_url_part is just the filename, not a full path
+            url_filename = Path(custom_url_part).name
+            # Construct URL for historical archive files
+            # Example: https://data.sec.gov/submissions/CIK0000320193-submissions-001.json
+            url = f"https://data.sec.gov/submissions/{url_filename}"
+
         else:
+            # Construct URL for the main CIK index file
+            # Example: https://data.sec.gov/submissions/CIK0000320193.json
             url = f"https://data.sec.gov/submissions/CIK{cik_formatted}.json"
 
-        logger.info(f"Fetching filings index from: {url}")
-
-        # console.print(f"[bold magenta]Fetching filings from: {url}[/bold magenta]") # Replaced with logger
-        time.sleep(self.request_interval)  # Respect rate limits
+        logger.debug(f"Fetching/caching JSON from: {url}")
+        time.sleep(self.request_interval)
         try:
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-            logger.info(f"Successfully fetched filings index for CIK {cik_formatted}")
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(
-                # f"[bold red]Error fetching filings: {response.status_code} - {response.reason}[/bold red]" # Replaced with logger format
-                f"Error fetching filings index for CIK {cik_formatted} from {url}: {e}"
+            local_file_path_str = self.http_cache.cache_file(url)
+            if not local_file_path_str:  # cache_file can return None on error
+                logger.error(
+                    f"HttpCache failed to retrieve or cache file for URL: {url}"
+                )
+                return None
+            with open(local_file_path_str, "rb") as f:
+                response_bytes = f.read()
+            response_str = response_bytes.decode("utf-8")
+            data = json.loads(response_str)
+            logger.debug(
+                f"Successfully parsed JSON from {url} (via cache: {local_file_path_str})"
             )
+            return data
+        except Exception as e:
+            logger.error(f"Error fetching/parsing JSON from {url}: {e}", exc_info=True)
             return None
-        except json.JSONDecodeError as e:
-            logger.error(
-                f"Error decoding JSON response for CIK {cik_formatted} from {url}: {e}"
+
+    # Helper function to extract filing dicts from potentially columnar JSON
+    def _extract_filings_from_json_data(
+        self, filings_data_json: Optional[Dict], cik_formatted: str
+    ) -> List[Dict]:
+        """Safely extracts a list of filing dictionaries from SEC JSON structures."""
+        filings_list = []
+        if not isinstance(filings_data_json, dict):
+            logger.debug(
+                f"Expected dict for filings_data_json for CIK {cik_formatted}, got {type(filings_data_json)}. Skipping."
             )
-            return None
-
-    def search_10k_filings(
-        self,
-        ticker: str,
-        cik: str,
-        year: Optional[int] = None,
-        start_year: Optional[int] = None,
-        end_year: Optional[int] = None,
-    ) -> pl.DataFrame:  # Updated return type
-        """
-        Search for 10-K filings for a specific company using the SEC submissions API.
-
-        Args:
-            ticker (str): The ticker symbol of the company
-            cik (str): The CIK number of the company
-            year (int, optional): Filter by specific filing year
-            start_year (int, optional): Start year for filing search range
-            end_year (int, optional): End year for filing search range
-
-        Returns:
-            A Polars DataFrame of 10-K filing data
-        """
-        # Get all filings for the company
-        filings_data = self.get_company_filings(cik)
-        if not filings_data:
-            return pl.DataFrame()
-
-        all_filings_list = []
-
-        def extract_filings_from_data(filings_data):
-            filings_list = []
-            if isinstance(filings_data, dict):
-                if isinstance(filings_data.get("accessionNumber"), list):
-                    try:
-                        num_filings = len(filings_data.get("accessionNumber", []))
-                        keys = filings_data.keys()
-                        for i in range(num_filings):
-                            filing_dict = {
-                                key: filings_data[key][i]
-                                for key in keys
-                                if i < len(filings_data[key])
-                            }
-                            filings_list.append(filing_dict)
-                    except Exception as e:
-                        logger.error(
-                            f"Error processing potentially columnar 'recent' data for CIK {cik}: {e}"
-                        )
-                else:  # Assume it's already a list of dicts (the common case)
-                    filings_list.extend(filings_data)
-
             return filings_list
 
-        # 1. Process recent filings (if they exist)
-        if "filings" in filings_data and "recent" in filings_data["filings"]:
-            recent_filings = filings_data["filings"]["recent"]
-            all_filings_list.extend(extract_filings_from_data(recent_filings))
+        # Data might be directly under keys in filings_data_json (common for historical archives)
+        # or nested under filings_data_json['filings']['recent'] (common for main CIK index)
 
-        if "filings" in filings_data and "files" in filings_data["filings"]:
-            historical_files_data = filings_data["filings"]["files"]
+        # Try to access data assuming it might be columnar directly or in a known nested structure
+        data_to_process = None
+        if "accessionNumber" in filings_data_json and isinstance(
+            filings_data_json["accessionNumber"], list
+        ):
+            data_to_process = filings_data_json  # Assume current level is columnar
+        elif "filings" in filings_data_json and isinstance(
+            filings_data_json["filings"], dict
+        ):
+            recent_filings = filings_data_json["filings"].get("recent")
+            if (
+                isinstance(recent_filings, dict)
+                and "accessionNumber" in recent_filings
+                and isinstance(recent_filings["accessionNumber"], list)
+            ):
+                data_to_process = recent_filings  # Process 'recent' section
 
-            for file in historical_files_data:
-                logger.info(
-                    f"Fetching historical file submission file {file['name']} for CIK {cik}"
+        if data_to_process:
+            try:
+                num_filings = len(data_to_process.get("accessionNumber", []))
+                keys = list(data_to_process.keys())
+                for i in range(num_filings):
+                    filing_dict = {}
+                    for key in keys:
+                        if (
+                            key in data_to_process
+                            and isinstance(data_to_process[key], list)
+                            and i < len(data_to_process[key])
+                        ):
+                            filing_dict[key] = data_to_process[key][i]
+                        else:
+                            filing_dict[key] = None  # Ensure all keys are present
+                    filings_list.append(filing_dict)
+            except Exception as e:
+                logger.error(
+                    f"Error processing columnar JSON data for CIK {cik_formatted}: {e}",
+                    exc_info=True,
                 )
+        elif isinstance(filings_data_json, list):  # Fallback if root is a list of dicts
+            filings_list.extend(filings_data_json)
+        else:
+            logger.debug(
+                f"Could not determine columnar data in filings_data_json for CIK {cik_formatted}. Keys: {list(filings_data_json.keys())}"
+            )
+
+        return filings_list
+
+    def _get_all_filings_for_cik_raw(self, cik_formatted: str) -> pl.DataFrame:
+        """
+        Fetches all filing entries for a CIK (recent and historical)
+        and returns them as a single, unfiltered Polars DataFrame.
+        Uses _cik_raw_data_store.
+        """
+        if cik_formatted in self._cik_raw_data_store:
+            logger.debug(f"Cache hit for raw combined filings for CIK {cik_formatted}.")
+            return self._cik_raw_data_store[cik_formatted]
+
+        logger.debug(f"Fetching raw combined filings for CIK {cik_formatted}.")
+        all_filings_list: List[Dict] = []
+
+        # 1. Get the main CIK index file (e.g., CIK0000320193.json)
+        main_cik_index_json = self._get_json_for_cik_and_url(cik_formatted, None)
+
+        if not main_cik_index_json:
+            logger.warning(f"Could not retrieve main CIK index for {cik_formatted}.")
+            self._cik_raw_data_store[cik_formatted] = pl.DataFrame(
+                schema=RAW_FILING_SCHEMA
+            )
+            return self._cik_raw_data_store[cik_formatted]
+
+        # 2. Process "recent" filings from the main CIK index
+        if "filings" in main_cik_index_json and isinstance(
+            main_cik_index_json["filings"], dict
+        ):
+            recent_filings_data = main_cik_index_json["filings"].get("recent")
+            if recent_filings_data:
+                logger.debug(f"Processing 'recent' filings for CIK {cik_formatted}")
                 all_filings_list.extend(
-                    extract_filings_from_data(
-                        self.get_company_filings(cik, file["name"])
+                    self._extract_filings_from_json_data(
+                        recent_filings_data, cik_formatted
                     )
                 )
 
-        if not all_filings_list:
-            logger.warning(
-                f"CIK {cik}: No filings found in 'recent' or 'files' sections."
-            )
-            return pl.DataFrame()
-
-        # Define expected columns and types (can remain the same)
-        expected_schema = {
-            "accessionNumber": pl.Utf8,
-            "filingDate": pl.Utf8,
-            "reportDate": pl.Utf8,
-            "form": pl.Utf8,
-            "primaryDocument": pl.Utf8,
-            "primaryDocDescription": pl.Utf8,
-            # Allow other columns to exist
-        }
-
-        try:
-            # Create Polars DataFrame from the combined list
-            filings_df = pl.DataFrame(
-                all_filings_list, schema_overrides=expected_schema
-            )
-        except Exception as e:
-            logger.error(
-                f"Error creating Polars DataFrame from combined SEC filings data for CIK {cik}: {e}",
-                exc_info=True,  # Add traceback
-            )
-            # Log sample data for debugging
-            if all_filings_list:
-                logger.error(
-                    f"Sample problematic data for CIK {cik}: {all_filings_list[:2]}"
-                )
-            return pl.DataFrame()
-
-        # --- Debugging Step: Log raw data ---
-        if not filings_df.is_empty():
-            logger.debug(
-                f"Combined filings data columns for CIK {cik}: {filings_df.columns}"
-            )
-            logger.debug(
-                f"Combined filings data head for CIK {cik}:\n{filings_df.head(5)}"
-            )
-        else:
-            logger.debug(f"No combined filings data created for CIK {cik}.")
-        # --- End Debugging Step ---
-
-        # Check if essential columns exist (can remain the same)
-        required_cols = [
-            "form",
-            "filingDate",
-            # "reportDate", # Report date might be missing in older filings sometimes
-            "accessionNumber",
-            "primaryDocument",
-        ]
-        # Check only for absolutely essential columns for filtering and URL generation
-        if not all(
-            col in filings_df.columns
-            for col in ["form", "accessionNumber", "primaryDocument", "filingDate"]
+        # 3. Process "historical" archive files listed in the main CIK index
+        if "filings" in main_cik_index_json and isinstance(
+            main_cik_index_json["filings"], dict
         ):
-            logger.warning(
-                f"Combined filing data structure is missing essential columns for CIK {cik}. Found: {filings_df.columns}. Needed: ['form', 'accessionNumber', 'primaryDocument', 'filingDate']"
+            historical_files_info = main_cik_index_json["filings"].get("files", [])
+            logger.debug(
+                f"Found {len(historical_files_info)} historical archive files for CIK {cik_formatted}."
             )
-            # Allow proceeding but log heavily
-            # return pl.DataFrame() # Maybe too strict?
+            for file_info in historical_files_info:
+                archive_file_name = file_info.get("name")
+                if not archive_file_name:
+                    logger.warning(
+                        f"Skipping historical archive with no name for CIK {cik_formatted}: {file_info}"
+                    )
+                    continue
 
-        # Filter only 10-K filings using the 'form' column (this is now applied to the combined data)
-        # --- Corrected Filter ---
-        form_10k_df = filings_df.filter(pl.col("form") == "10-K")  # Use 'form' column
-        # --- End Correction ---
+                logger.debug(
+                    f"Fetching historical archive: {archive_file_name} for CIK {cik_formatted}"
+                )
+                historical_archive_json = self._get_json_for_cik_and_url(
+                    cik_formatted, custom_url_part=archive_file_name
+                )
+                if historical_archive_json:
+                    all_filings_list.extend(
+                        self._extract_filings_from_json_data(
+                            historical_archive_json, cik_formatted
+                        )
+                    )
 
-        if form_10k_df.is_empty():
-            # Log check for other forms too
+        # 4. Create DataFrame
+        if not all_filings_list:
             logger.info(
-                f"No primary 10-K filings found (form='10-K') in the combined filings for CIK {cik}. Available forms: {filings_df['form'].unique().to_list()}"
+                f"No filings found for CIK {cik_formatted} after processing recent and historical."
+            )
+            raw_df = pl.DataFrame(schema=RAW_FILING_SCHEMA)
+        else:
+            logger.info(
+                f"Combined {len(all_filings_list)} raw filing records for CIK {cik_formatted}."
+            )
+            try:
+                raw_df = pl.DataFrame(
+                    all_filings_list, schema_overrides=RAW_FILING_SCHEMA, strict=False
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error creating raw DataFrame for CIK {cik_formatted}: {e}",
+                    exc_info=True,
+                )
+                raw_df = pl.DataFrame(schema=RAW_FILING_SCHEMA)
+
+        self._cik_raw_data_store[cik_formatted] = raw_df
+        return raw_df
+
+    def get_filings_for_cik_ticker_year(
+        self, cik: str, ticker: str, year: int
+    ) -> pl.DataFrame:
+        """
+        Public method to get 10-K filings for a specific CIK, Ticker, and Year.
+        """
+        cik_formatted = str(cik).zfill(10)
+
+        # Step 1: Get all raw filings for the CIK (uses cache)
+        combined_df = self._get_all_filings_for_cik_raw(cik_formatted)
+
+        if combined_df.is_empty():
+            logger.debug(
+                f"No raw filings data found for CIK {cik_formatted} to filter for year {year}."
             )
             return pl.DataFrame()
 
-        # Process dates and add columns using Polars `with_columns`
-        # Use Polars expressions for transformations
+        # Step 2: Filter the raw DataFrame
         try:
-            form_10k_df = form_10k_df.with_columns(
+            # Ensure 'form' column exists
+            if "form" not in combined_df.columns:
+                logger.warning(
+                    f"Raw DataFrame for CIK {cik_formatted} missing 'form' column. Cannot filter 10-Ks."
+                )
+                return pl.DataFrame()
+
+            filtered_df = combined_df.filter(pl.col("form") == "10-K")
+            if filtered_df.is_empty():
+                logger.debug(
+                    f"No 10-K forms found for CIK {cik_formatted} in raw data."
+                )
+                return pl.DataFrame()
+
+            # Ensure 'filingDate' column exists for year filtering
+            if "filingDate" not in filtered_df.columns:
+                logger.warning(
+                    f"10-K DataFrame for CIK {cik_formatted} missing 'filingDate' column. Cannot filter by year."
+                )
+                return pl.DataFrame()
+
+            # Process dates and derive filing_year
+            # Handle potential errors during date parsing or year extraction
+            date_processed_df = filtered_df.with_columns(
+                pl.col("filingDate")
+                .str.strptime(pl.Date, "%Y-%m-%d", strict=False)
+                .alias("filing_date_dt_temp")
+            ).with_columns(
+                pl.col("filing_date_dt_temp")
+                .dt.year()
+                .cast(pl.Int64, strict=False)
+                .alias("filing_year_temp")
+            )
+
+            # Filter by the requested year
+            year_filtered_df = date_processed_df.filter(
+                pl.col("filing_year_temp") == year
+            )
+
+            if year_filtered_df.is_empty():
+                logger.debug(
+                    f"No 10-K filings found for CIK {cik_formatted}, Ticker {ticker} for year {year}."
+                )
+                return pl.DataFrame()
+
+            # Add other derived columns
+            final_df = year_filtered_df.with_columns(
                 [
-                    # Extract filing year
-                    pl.col("filingDate")
-                    .str.split("-")
-                    .list.get(0)
-                    .cast(pl.Int64)
-                    .alias("filing_year"),
-                    # Convert filingDate to Date type
+                    pl.lit(cik_formatted).alias("cik"),
+                    pl.lit(ticker).alias("ticker"),
                     pl.col("filingDate")
                     .str.strptime(pl.Date, "%Y-%m-%d", strict=False)
-                    .alias("filing_date_dt"),
-                    # Convert reportDate to Date type, handling potential errors
+                    .alias("filing_date_dt"),  # Re-add for final schema
                     pl.col("reportDate")
                     .str.strptime(pl.Date, "%Y-%m-%d", strict=False)
                     .alias("report_date_dt"),
+                    pl.col("filing_year_temp").alias(
+                        "filing_year"
+                    ),  # Rename temp year column
+                    pl.lit(datetime.now()).alias("processed_datetime"),
                 ]
             )
+
+            # Corrected CIK formatting for URL path
+            final_df = final_df.with_columns(
+                (
+                    pl.lit(self.base_url + "edgar/data/")
+                    + pl.col("cik").cast(pl.Int64).cast(pl.Utf8)
+                    + "/"  # Corrected: remove leading zeros for path
+                    + pl.col("accessionNumber").str.replace_all("-", "")
+                    + "/"
+                    + pl.col("accessionNumber")
+                    + "-index.html"
+                ).alias("documents_url"),
+                pl.when(
+                    pl.col("primaryDocument").is_not_null()
+                    & (pl.col("primaryDocument") != "")
+                )
+                .then(
+                    pl.lit(self.base_url + "edgar/data/")
+                    + pl.col("cik").cast(pl.Int64).cast(pl.Utf8)
+                    + "/"  # Corrected: remove leading zeros for path
+                    + pl.col("accessionNumber").str.replace_all("-", "")
+                    + "/"
+                    + pl.col("primaryDocument")
+                )
+                .otherwise(None)
+                .alias("xbrl_instance_url"),
+            )
+
+            # Select and reorder final columns
+            # Must match TARGET_METADATA_SCHEMA from universe.py
+            final_columns_ordered = [
+                "ticker",
+                "cik",
+                "form",
+                "accessionNumber",
+                "filingDate",
+                "filing_date_dt",
+                "filing_year",
+                "reportDate",
+                "report_date_dt",
+                "primaryDocument",
+                "primaryDocDescription",
+                "documents_url",
+                "xbrl_instance_url",
+                "processed_datetime",
+            ]
+
+            # Ensure all expected columns are present, add nulls if not
+            for col_name in final_columns_ordered:
+                if col_name not in final_df.columns:
+                    if col_name in ["filing_date_dt", "report_date_dt"]:
+                        final_df = final_df.with_columns(
+                            pl.lit(None, dtype=pl.Date).alias(col_name)
+                        )
+                    elif col_name == "filing_year":
+                        final_df = final_df.with_columns(
+                            pl.lit(None, dtype=pl.Int64).alias(col_name)
+                        )
+                    else:
+                        final_df = final_df.with_columns(
+                            pl.lit(None, dtype=pl.Utf8).alias(col_name)
+                        )
+
+            return final_df.select(final_columns_ordered)
+
         except Exception as e:
             logger.error(
-                f"Error processing dates for CIK {cik}: {e}. Some date conversions might fail."
+                f"Error filtering/processing for CIK {cik_formatted}, Ticker {ticker}, Year {year}: {e}",
+                exc_info=True,
             )
-            # Continue processing, but be aware dates might be null
-
-        # Apply year filters if specified using Polars filter
-        if year is not None:
-            form_10k_df = form_10k_df.filter(pl.col("filing_year") == year)
-        elif start_year is not None and end_year is not None:
-            form_10k_df = form_10k_df.filter(
-                (pl.col("filing_year") >= start_year)
-                & (pl.col("filing_year") <= end_year)
-            )
-
-        if form_10k_df.is_empty():
-            logger.info(
-                f"No 10-K filings found for CIK {cik} matching the year filter ({year or f'{start_year}-{end_year}'})."
-            )
-            return pl.DataFrame()  # Return empty Polars DF
-
-        # Format CIK with leading zeros
-        cik_formatted = str(cik).zfill(10)
-
-        # Add remaining columns using Polars `with_columns`
-        # Generate URLs using Polars string expressions
-        try:
-            form_10k_df = form_10k_df.with_columns(
-                [
-                    pl.lit(cik_formatted).alias("cik"),  # Add cik column
-                    pl.lit(ticker).alias("ticker"),  # Add ticker column
-                    # Generate document URLs (index page)
-                    (
-                        pl.lit("https://www.sec.gov/Archives/edgar/data/")
-                        + pl.lit(cik_formatted)
-                        + "/"
-                        + pl.col("accessionNumber").str.replace_all("-", "")
-                        + "/"
-                        + pl.col("accessionNumber")
-                        + "-index.html"
-                    ).alias("documents_url"),
-                    # Generate direct URL to the primary document (often the iXBRL/HTML file)
-                    pl.when(
-                        pl.col("primaryDocument").is_not_null()
-                        & (pl.col("primaryDocument") != "")
-                    )
-                    .then(
-                        pl.lit("https://www.sec.gov/Archives/edgar/data/")
-                        + pl.lit(cik_formatted)
-                        + "/"
-                        + pl.col("accessionNumber").str.replace_all("-", "")
-                        + "/"
-                        + pl.col(
-                            "primaryDocument"
-                        )  # Use the primaryDocument filename directly
-                    )
-                    .otherwise(None)  # Set to null if primaryDocument is missing/empty
-                    .alias(
-                        "xbrl_instance_url"
-                    ),  # Keep alias name for consistency downstream
-                ]
-            )
-        except Exception as e:
-            logger.error(f"Error adding CIK, Ticker, or URL columns for CIK {cik}: {e}")
-            # Return the DataFrame as is, but URLs might be missing/incorrect
-
-        # Select and reorder columns for final output
-        final_columns = [
-            "ticker",
-            "cik",
-            "form",
-            "accessionNumber",
-            "filingDate",
-            "filing_date_dt",
-            "filing_year",
-            "reportDate",
-            "report_date_dt",
-            "primaryDocument",
-            "primaryDocDescription",
-            "documents_url",
-            "xbrl_instance_url",
-        ]
-        # Filter to only columns that actually exist in the df, in the desired order
-        final_columns = [col for col in final_columns if col in form_10k_df.columns]
-        form_10k_df = form_10k_df.select(final_columns)
-
-        return form_10k_df
-
-    def fetch_filings_for_universe(
-        # Use the TYPE_CHECKING import here for the type hint
-        self,
-        universe: "Universe",
-        ticker_to_cik_mapping: Dict[str, str],
-    ) -> pl.DataFrame:  # Updated return type
-        """
-        Fetch 10-K filings for all securities in a Universe based on its year range.
-
-        Args:
-            universe: The Universe object containing securities and year range.
-            ticker_to_cik_mapping: Dictionary mapping tickers to CIK numbers.
-
-        Returns:
-            Polars DataFrame containing all filings found for the universe within its range.
-        """
-        all_filings_dfs: List[pl.DataFrame] = []  # List to hold Polars DataFrames
-        filing_years = universe.get_filing_years()
-
-        # Use default range if no filing years specified
-        if not filing_years:
-            current_year = datetime.now().year
-            start_year = current_year - 3  # Default to last 3 years + current
-            end_year = current_year
-            logger.info(
-                f"No filing years specified in universe '{universe.name}'. Using default range: {start_year}-{end_year}"
-            )
-        else:
-            start_year = min(filing_years)
-            end_year = max(filing_years)
-
-        for ticker in universe.get_tickers():
-            if ticker in ticker_to_cik_mapping:
-                cik = ticker_to_cik_mapping[ticker]
-                # Ensure CIK is properly formatted
-                cik_formatted = str(cik).zfill(10)
-
-                logger.info(
-                    f"Searching for {ticker} (CIK: {cik_formatted}) filings between {start_year}-{end_year}"
-                )
-
-                # This now returns a Polars DataFrame
-                filings_df = self.search_10k_filings(
-                    ticker, cik_formatted, start_year=start_year, end_year=end_year
-                )
-
-                if not filings_df.is_empty():  # Use Polars is_empty()
-                    all_filings_dfs.append(filings_df)
-                    logger.info(
-                        f"Found {len(filings_df)} 10-K filings for {ticker} between {start_year}-{end_year}"
-                    )
-                else:
-                    logger.info(
-                        f"No 10-K filings found for {ticker} in period {start_year}-{end_year}."
-                    )
-
-                time.sleep(
-                    self.request_interval
-                    * 1.5  # Slightly increased delay between companies
-                )
-            else:
-                # logger already warns about missing CIKs in load_ticker_to_cik_mapping
-                pass
-
-        # Combine all Polars DataFrames into a single one
-        if all_filings_dfs:
-            # Use pl.concat for combining Polars DataFrames
-            combined_df = pl.concat(
-                all_filings_dfs, how="vertical_relaxed"
-            )  # Use relaxed to handle potential schema variations slightly
-            # Add processing date/time as metadata using Polars
-            combined_df = combined_df.with_columns(
-                pl.lit(datetime.now()).alias("processed_datetime")
-            )
-            logger.info(
-                f"Combined {len(combined_df)} filings for universe '{universe.name}'."
-            )
-            return combined_df
-        else:
-            logger.warning(
-                f"No filings found for any ticker in universe '{universe.name}'."
-            )
-            return pl.DataFrame()  # Return empty Polars DataFrame if no filings found
+            return pl.DataFrame()
 
     def fetch_specific_filings(
         self,
@@ -529,95 +519,135 @@ class EDGARFetcher:
     ) -> pl.DataFrame:
         """
         Fetch specific 10-K filings based on a list of (ticker, filing_year) combinations.
-
-        Args:
-            filing_combinations: List of dictionaries, each like {'ticker': 'T', 'filing_year': Y}.
-            ticker_to_cik_mapping: Dictionary mapping required tickers to CIK numbers.
-
-        Returns:
-            A Polars DataFrame containing the successfully fetched filings.
         """
         specific_filings_dfs: List[pl.DataFrame] = []
         logger.info(
             f"Starting fetch for {len(filing_combinations)} specific filing combinations."
         )
 
+        self._cik_raw_data_store.clear()  # Clear raw CIK data store at the start of a new batch
+        logger.debug("Cleared CIK raw data store.")
+
         processed_combinations = 0
         for combo in filing_combinations:
-            ticker = combo.get("ticker")
-            year = combo.get("filing_year")
+            ticker_val = combo.get("ticker")  # Renamed
+            year_val = combo.get("filing_year")  # Renamed
 
-            if not isinstance(ticker, str) or not isinstance(year, int):
+            if not isinstance(ticker_val, str) or not isinstance(year_val, int):
                 logger.warning(f"Skipping invalid combination: {combo}")
                 continue
 
-            if ticker in ticker_to_cik_mapping:
-                cik = ticker_to_cik_mapping[ticker]
-                cik_formatted = str(cik).zfill(10)
+            if ticker_val in ticker_to_cik_mapping:
+                cik_val = ticker_to_cik_mapping[ticker_val]  # Renamed
 
                 logger.debug(
-                    f"Fetching specific filing for {ticker} (CIK: {cik_formatted}), year: {year}"
+                    f"Processing: Ticker {ticker_val}, CIK {cik_val}, Year {year_val}"
                 )
 
-                # Reuse existing search method, filtering by specific year
-                filing_df = self.search_10k_filings(ticker, cik_formatted, year=year)
+                # Call the new method
+                filing_df = self.get_filings_for_cik_ticker_year(
+                    cik_val, ticker_val, year_val
+                )
 
                 if not filing_df.is_empty():
-                    # We expect only one 10-K per year, but search_10k_filings might return amendments.
-                    # Filter further if needed, or just take the first one.
-                    # For simplicity, let's assume search_10k_filings is precise enough or take the latest if multiple.
+                    # get_filings_for_cik_ticker_year should ideally return one 10-K or none.
+                    # If multiple (e.g. amendments), this logic might take the first if not handled inside.
+                    # For now, assume it's handled or take what's given.
                     if len(filing_df) > 1:
                         logger.warning(
-                            f"Found {len(filing_df)} filings for {ticker} in year {year}. Using the latest based on filingDate."
+                            f"Found {len(filing_df)} filings for {ticker_val} in year {year_val}. Expected one 10-K. Using all."
                         )
-                        # Ensure 'filing_date_dt' exists and is sortable
-                        if (
-                            "filing_date_dt" in filing_df.columns
-                            and filing_df["filing_date_dt"].dtype == pl.Date
-                        ):
-                            filing_df = filing_df.sort(
-                                "filing_date_dt", descending=True
-                            ).head(1)
-                        else:
-                            # Fallback if date conversion failed or column missing
-                            filing_df = filing_df.head(1)
-
                     specific_filings_dfs.append(filing_df)
                     logger.debug(
-                        f"Successfully fetched filing for {ticker}, year {year}."
+                        f"Successfully processed data for {ticker_val}, year {year_val}. Rows: {len(filing_df)}"
                     )
                 else:
-                    logger.warning(
-                        f"Did not find 10-K filing for {ticker}, year {year}."
-                    )
+                    logger.info(
+                        f"No 10-K filing data found for {ticker_val}, year {year_val}."
+                    )  # Changed to info
 
                 processed_combinations += 1
-                if processed_combinations % 5 == 0:  # Add delay every few requests
-                    time.sleep(self.request_interval * 1.5)
-                else:
-                    time.sleep(self.request_interval)  # Standard delay
-
+                # Modest delay between CIKs, more frequent for actual fetches inside helpers
+                if processed_combinations % 10 == 0:
+                    time.sleep(self.request_interval * 0.5)  # Shorter general delay
             else:
                 logger.warning(
-                    f"Skipping {ticker} year {year}: CIK not found in provided mapping."
+                    f"Skipping {ticker_val} year {year_val}: CIK not found in provided mapping."
                 )
 
-        # Combine results
+        self._cik_raw_data_store.clear()  # Clear store at the end
+        logger.debug("Cleared CIK raw data store after operation.")
+
         if specific_filings_dfs:
-            combined_df = pl.concat(specific_filings_dfs, how="vertical_relaxed")
-            # Add processing date/time
-            combined_df = combined_df.with_columns(
-                pl.lit(datetime.now()).alias("processed_datetime")
-            )
-            logger.info(
-                f"Finished fetching. Combined {len(combined_df)} specific filings successfully."
-            )
-            return combined_df
+            # Ensure all dataframes have compatible schemas before concat, using TARGET_METADATA_SCHEMA
+            # This is crucial if some processing steps fail and DataFrames have different columns
+            final_dfs_to_concat = []
+            from alphaledger.universe import (
+                TARGET_METADATA_SCHEMA,
+            )  # Import for schema reference
+
+            expected_cols_ordered = list(TARGET_METADATA_SCHEMA.keys())
+            polars_schema = {
+                name: dtype for name, dtype in TARGET_METADATA_SCHEMA.items()
+            }
+
+            for i, df in enumerate(specific_filings_dfs):
+                if df.is_empty():
+                    # Create an empty DataFrame with the target schema to ensure concat works
+                    # This handles cases where a ticker/year combo yielded no results
+                    final_dfs_to_concat.append(pl.DataFrame(schema=polars_schema))
+                    continue
+
+                current_cols = df.columns
+                select_exprs = []
+                for col_name in expected_cols_ordered:
+                    if col_name in current_cols:
+                        select_exprs.append(pl.col(col_name))
+                    else:
+                        # Add missing column as null literal with correct type
+                        select_exprs.append(
+                            pl.lit(None, dtype=TARGET_METADATA_SCHEMA[col_name]).alias(
+                                col_name
+                            )
+                        )
+                try:
+                    aligned_df = df.select(select_exprs)
+                    final_dfs_to_concat.append(aligned_df)
+                except Exception as e:
+                    logger.error(
+                        f"Schema alignment error for DataFrame {i} (Ticker: {df.select('ticker').head(1).item() if 'ticker' in df.columns else 'N/A'}): {e}. Columns: {df.columns}",
+                        exc_info=True,
+                    )
+                    # Append an empty DataFrame with target schema on error
+                    final_dfs_to_concat.append(pl.DataFrame(schema=polars_schema))
+
+            if not final_dfs_to_concat:  # If all processing failed or no data
+                logger.warning("No valid DataFrames to concatenate after alignment.")
+                return pl.DataFrame()
+
+            try:
+                combined_df = pl.concat(
+                    final_dfs_to_concat, how="diagonal_relaxed"
+                )  # Diagonal might be safer if alignment isn't perfect
+                logger.info(
+                    f"Finished fetching. Combined {len(combined_df)} specific filings successfully."
+                )
+                return combined_df
+            except Exception as e:
+                logger.error(
+                    f"Error concatenating final DataFrames: {e}", exc_info=True
+                )
+                # Log details of the DFs that failed to concat
+                for i, df_to_log in enumerate(final_dfs_to_concat):
+                    logger.debug(
+                        f"DataFrame {i} for concat: Schema: {df_to_log.schema}, Shape: {df_to_log.shape}"
+                    )
+                return pl.DataFrame()  # Return empty on concat error
         else:
             logger.info(
-                "Finished fetching specific filings. No new filings were found."
+                "Finished fetching specific filings. No new filings were found or processed."
             )
-            return pl.DataFrame()  # Return empty DataFrame if nothing was fetched
+            return pl.DataFrame()
 
     def save_filings_to_disk(
         self,
@@ -684,7 +714,26 @@ class EDGARFetcher:
             elif file_format.lower() == "csv":
                 filings_df.write_csv(file_path)
             elif file_format.lower() == "delta":
-                filings_df.write_delta(file_path)
+                # Delta write expects a directory path, ensure it's treated as such
+                if file_path.suffix == ".delta":  # if user provided path/to/table.delta
+                    delta_table_path = str(file_path)
+                else:  # if user provided path/to/table (no ext) or path/to/dir
+                    delta_table_path = str(file_path)
+
+                # For overwrite, Delta Lake typically requires removing the old table first if schema changes etc.
+                # Or use mode="overwrite" with appropriate options.
+                # Simple overwrite for now:
+                if Path(delta_table_path).exists():
+                    import shutil
+
+                    if Path(delta_table_path).is_dir():
+                        shutil.rmtree(delta_table_path)
+                    else:  # Parquet file was perhaps written here before
+                        Path(delta_table_path).unlink()
+
+                filings_df.write_delta(
+                    delta_table_path, mode="overwrite"
+                )  # Ensure path is string
             else:
                 logger.error(f"Unsupported file format for saving: {file_format}")
                 return None
@@ -698,45 +747,91 @@ class EDGARFetcher:
             )
             return None
 
-    def load_filings_from_disk(
-        self, file_path: Union[str, Path]
-    ) -> pl.DataFrame:  # Updated return type and input hint
-        """
-        Load filings from a saved file into a Polars DataFrame.
-
-        Args:
-            file_path: Path (string or Path object) to the saved filings file
-
-        Returns:
-            Polars DataFrame containing the filings data, or empty DataFrame if error/not found.
-        """
-        file_path_obj = Path(file_path)  # Ensure Path object
+    def load_filings_from_disk(self, file_path: Union[str, Path]) -> pl.DataFrame:
+        file_path_obj = Path(file_path)
+        # Ensure TARGET_METADATA_SCHEMA is available for returning empty DFs with schema
+        from alphaledger.universe import TARGET_METADATA_SCHEMA
 
         if not file_path_obj.exists():
             logger.error(f"File not found: {file_path_obj}")
-            return pl.DataFrame()  # Return empty Polars DF
+            return pl.DataFrame(schema=TARGET_METADATA_SCHEMA)
 
         try:
             if file_path_obj.suffix.lower() == ".parquet":
-                logger.info(f"Loading Parquet file: {file_path_obj}")
+                # For parquet, we assume schema matches if written by this system
+                # Consider adding alignment if parquet files can come from other sources
                 return pl.read_parquet(file_path_obj)
             elif file_path_obj.suffix.lower() == ".csv":
-                logger.info(f"Loading CSV file: {file_path_obj}")
-                # Use infer_schema_length=10000 for better type inference on larger CSVs
-                return pl.read_csv(
+                # CSVs are less strict, try to parse dates but schema alignment might be needed
+                df = pl.read_csv(
                     file_path_obj, infer_schema_length=10000, try_parse_dates=True
                 )
-            elif file_path_obj.suffix.lower() == ".delta":
-                logger.info(f"Loading Delta file: {file_path}")
-                return pl.read_delta(file_path)
+                # Basic alignment for CSVs - this could be more robust
+                aligned_cols = []
+                for col_name, expected_type in TARGET_METADATA_SCHEMA.items():
+                    if col_name in df.columns:
+                        try:
+                            aligned_cols.append(
+                                pl.col(col_name).cast(expected_type, strict=False)
+                            )
+                        except pl.PolarsError:
+                            logger.warning(
+                                f"CSV load: Could not cast '{col_name}' to {expected_type}. Keeping original or null."
+                            )
+                            aligned_cols.append(
+                                pl.lit(None, dtype=expected_type).alias(col_name)
+                            )
+                    else:
+                        aligned_cols.append(
+                            pl.lit(None, dtype=expected_type).alias(col_name)
+                        )
+                return df.select(aligned_cols)  # Select to ensure order and presence
+            elif (
+                file_path_obj.is_dir() or file_path_obj.suffix.lower() == ".delta"
+            ):  # Delta tables are dirs
+                try:
+                    df = pl.read_delta(str(file_path_obj))
+                    # Ensure schema matches TARGET_METADATA_SCHEMA after load
+                    aligned_df_list = []
+                    for col_name, expected_dtype in TARGET_METADATA_SCHEMA.items():
+                        if col_name in df.columns:
+                            if df[col_name].dtype != expected_dtype:
+                                try:
+                                    aligned_df_list.append(
+                                        pl.col(col_name).cast(
+                                            expected_dtype, strict=False
+                                        )
+                                    )
+                                except pl.PolarsError:
+                                    logger.warning(
+                                        f"Delta load: Could not cast column '{col_name}' to {expected_dtype}. Keeping original."
+                                    )
+                                    aligned_df_list.append(
+                                        pl.col(col_name)
+                                    )  # keep original if cast fails
+                            else:
+                                aligned_df_list.append(pl.col(col_name))
+                        else:
+                            aligned_df_list.append(
+                                pl.lit(None, dtype=expected_dtype).alias(col_name)
+                            )
+                    return df.select(aligned_df_list)
+                except Exception as inner_e:
+                    logger.error(
+                        f"Error reading or aligning Delta table {file_path_obj}: {inner_e}",
+                        exc_info=True,
+                    )
+                    return pl.DataFrame(schema=TARGET_METADATA_SCHEMA)
             else:
-                logger.error(f"Unsupported file format: {file_path_obj.suffix}")
-                return pl.DataFrame()  # Return empty Polars DF
+                logger.error(f"Unsupported file format or path type: {file_path_obj}")
+                return pl.DataFrame(schema=TARGET_METADATA_SCHEMA)
         except Exception as e:
             logger.error(f"Error loading file {file_path_obj}: {e}", exc_info=True)
-            return pl.DataFrame()  # Return empty Polars DF
+            return pl.DataFrame(schema=TARGET_METADATA_SCHEMA)
 
-    def get_filing_by_accession_number(self, cik, accession_number, file_type="10-K"):
+    def get_filing_by_accession_number(
+        self, cik: str, accession_number: str, file_type="10-K"
+    ):  # Unused 'file_type'
         """
         Get a specific filing by accession number.
 
@@ -748,22 +843,11 @@ class EDGARFetcher:
         Returns:
             The text content of the filing
         """
-        # Format CIK with leading zeros to 10 digits
         cik_formatted = str(cik).zfill(10)
-        # Remove dashes from accession number
         acc_no_clean = accession_number.replace("-", "")
-
-        # Format the URL to get the full text submission
-        # Check if it's the full submission txt or a specific document
-        # Assuming full submission based on '.txt'
-        # Example: https://www.sec.gov/Archives/edgar/data/320193/000032019323000106/aapl-20230930.htm (primary doc)
-        # Example: https://www.sec.gov/Archives/edgar/data/320193/000032019323000106/0000320193-23-000106.txt (full submission)
-
-        # Let's stick to the full submission text file for now
-        url = f"{self.base_url}Archives/edgar/data/{cik_formatted}/{acc_no_clean}/{accession_number}.txt"
+        url = f"{self.base_url}edgar/data/{cik_formatted}/{acc_no_clean}/{accession_number}.txt"
         logger.debug(f"Fetching full submission text from: {url}")
-
-        time.sleep(self.request_interval)  # Respect rate limits
+        time.sleep(self.request_interval)
         try:
             response = requests.get(url, headers=self.headers)
             response.raise_for_status()
@@ -774,7 +858,7 @@ class EDGARFetcher:
             )
             return None
 
-    def extract_text_from_filing(self, filing_text):
+    def extract_text_from_filing(self, filing_text: Optional[str]):
         """
         Extract the relevant text content from an SEC filing.
         This is a basic implementation - you may need more sophisticated parsing
@@ -786,28 +870,24 @@ class EDGARFetcher:
         Returns:
             The extracted text content (simplified)
         """
-        from bs4 import BeautifulSoup  # Keep import local if only used here
+        if not filing_text:
+            return "No text content provided."
+        from bs4 import BeautifulSoup
 
-        # Split by <DOCUMENT> tags to separate documents
         documents = filing_text.split("<DOCUMENT>")
-
         for doc in documents:
-            # Look for 10-K document
-            if "<TYPE>10-K" in doc:
-                # Find the text content - this is simplified
-                # Real implementation would need better parsing
+            if "<TYPE>10-K" in doc:  # Simple check for 10-K
                 start_idx = doc.find("<TEXT>")
                 end_idx = doc.find("</TEXT>")
-
-                if start_idx > 0 and end_idx > 0:
-                    text_content = doc[start_idx + 6 : end_idx]
-                    # Remove HTML tags if present (simplified)
+                if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+                    text_content = doc[start_idx + len("<TEXT>") : end_idx]
                     soup = BeautifulSoup(text_content, "html.parser")
-                    return soup.get_text()
+                    return soup.get_text(separator="\n", strip=True)
+        return "No 10-K text content found in the filing."
 
-        return "No text content found in the filing."
-
-    def parse_filing_xbrl(self, row):
+    def parse_filing_xbrl(
+        self, row: pl.Series
+    ):  # row is a Polars Series if df.iter_rows(named=True)
         """
         Parse an XBRL filing using the schema and document URLs.
 
@@ -817,29 +897,45 @@ class EDGARFetcher:
         Returns:
             XbrlInstance object for the filing
         """
-        from xbrl.instance import XbrlParser, XbrlInstance  # Keep import local
+        from xbrl.instance import XbrlParser  # , XbrlInstance (unused)
 
-        parser = XbrlParser(self.cache)
+        parser = XbrlParser(self.http_cache)  # Use renamed http_cache
         try:
-            # Assuming row has 'xbrl_instance_url' or similar key
-            schema_url_key = (
-                "xbrl_instance_url"  # Match name used in search_10k_filings
+            schema_url_key = "xbrl_instance_url"
+            # row can be a dict if iterated from df.to_dicts() or Series from iter_rows
+            # Safely get value from polars Series or dict
+            schema_url = (
+                row[schema_url_key]
+                if isinstance(row, pl.Series)
+                else row.get(schema_url_key)
             )
-            if schema_url_key not in row or not row[schema_url_key]:
-                logger.warning(
-                    f"Missing or empty XBRL URL key ('{schema_url_key}') in row for ticker {row.get('ticker', 'N/A')}"
+
+            if not schema_url:
+                ticker_val = (
+                    row["ticker"]
+                    if isinstance(row, pl.Series) and "ticker" in row.index
+                    else row.get("ticker", "N/A")
                 )
+                logger.warning(f"Missing or empty XBRL URL for ticker {ticker_val}")
                 return None
 
-            schema_url = row[schema_url_key]
             logger.debug(f"Parsing XBRL instance from: {schema_url}")
+            time.sleep(self.request_interval)  # Ensure rate limiting
             inst = parser.parse_instance(schema_url)
             return inst
         except Exception as e:
-            ticker = row.get("ticker", "N/A")
-            filing_date = row.get("filingDate", "N/A")
+            ticker_val = (
+                row["ticker"]
+                if isinstance(row, pl.Series) and "ticker" in row.index
+                else row.get("ticker", "N/A")
+            )
+            filing_date_val = (
+                row["filingDate"]
+                if isinstance(row, pl.Series) and "filingDate" in row.index
+                else row.get("filingDate", "N/A")
+            )
             logger.error(
-                f"Error parsing XBRL for {ticker} (Filing Date: {filing_date}): {str(e)}",
+                f"Error parsing XBRL for {ticker_val} (Filing Date: {filing_date_val}): {e}",
                 exc_info=True,
             )
             return None

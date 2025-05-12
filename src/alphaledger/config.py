@@ -50,6 +50,7 @@ class AlphaLedgerSettings(BaseSettings):
     azure_openai_api_base: Optional[str] = None
     azure_openai_api_version: Optional[str] = None
     azure_openai_embedding_deployment_id: Optional[str] = None
+    azure_openai_chat_deployment_id: Optional[str] = None
     # SEC API settings
     sec_user_agent: str = Field(
         default="AlphaLedger (contact@alphaledger.com)",

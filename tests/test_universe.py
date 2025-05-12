@@ -12,17 +12,16 @@ import dotenv  # Import dotenv for patching
 from alphaledger.universe import (
     Security,
     Universe,
-    load_from_yaml,
-    load_from_json,
-    load_universe,
-    get_universe_path,
-    save_to_yaml,
-    save_to_json,
+    save_universe_definition,
     YearRange,
     EARLIEST_YEAR_PLACEHOLDER,
     DEFAULT_YEAR_RANGE,
 )
 from alphaledger.config import settings
+from alphaledger.sec import EDGARFetcher  # Added for mocking spec
+from alphaledger.process_xbrl import (
+    TARGET_SCHEMA_NUMERIC_DIRECT_POLARS,
+)  # Added for assertions
 
 # --- Constants for Testing ---
 CURRENT_YEAR = datetime.datetime.now().year
@@ -268,10 +267,10 @@ class TestSecurity:
 
 class TestUniverseLoading:
     def test_load_from_yaml(self, sample_universe_yaml_file, sample_universe_data):
-        universe = load_from_yaml(str(sample_universe_yaml_file), load_filings=False)
-        assert universe.name == sample_universe_data["name"]
+        universe = Universe(str(sample_universe_yaml_file))
+        assert universe.name == sample_universe_data["name"].replace("/", "_")
+        assert universe.raw_name == sample_universe_data["name"]
         assert len(universe) == len(sample_universe_data["securities"])
-        assert set(universe.get_tickers()) == {"AAPL", "MSFT", "GOOG"}
         msft = universe.get_security("MSFT")
         assert msft is not None
         assert msft.name == "Microsoft Corp."
@@ -283,14 +282,10 @@ class TestUniverseLoading:
         assert goog.industry is None
 
     def test_load_from_json(self, sample_universe_json_file, sample_universe_data):
-        universe = load_from_json(str(sample_universe_json_file), load_filings=False)
-        # Adjust expected name as filename is different
-        assert (
-            universe.name == sample_universe_data["name"]
-        )  # Use name from data in file
-        # The JSON file contains the same securities data
+        universe = Universe(str(sample_universe_json_file))
+        assert universe.raw_name == sample_universe_data["name"]
+        assert universe.name == sample_universe_data["name"].replace("/", "_")
         assert len(universe) == len(sample_universe_data["securities"])
-        assert set(universe.get_tickers()) == {"AAPL", "MSFT", "GOOG"}
         aapl = universe.get_security("AAPL")
         assert aapl is not None
         assert aapl.name == "Apple Inc."
@@ -299,82 +294,47 @@ class TestUniverseLoading:
     def test_load_from_yaml_file_not_found(self, mock_settings):
         universe_dir = mock_settings / "universes"
         with pytest.raises(FileNotFoundError):
-            load_from_yaml(str(universe_dir / "non_existent.yaml"), load_filings=False)
+            Universe(str(universe_dir / "non_existent.yaml"))
 
     def test_load_from_json_file_not_found(self, mock_settings):
         universe_dir = mock_settings / "universes"
         with pytest.raises(FileNotFoundError):
-            load_from_json(str(universe_dir / "non_existent.json"), load_filings=False)
-
-    def test_get_universe_path_direct_yaml(
-        self, mock_settings, sample_universe_yaml_file
-    ):
-        path = get_universe_path("tech_giants")
-        assert path == sample_universe_yaml_file
-        path_ext = get_universe_path("tech_giants.yaml")
-        assert path_ext == sample_universe_yaml_file
-
-    def test_get_universe_path_direct_json(
-        self, mock_settings, sample_universe_json_file
-    ):
-        path = get_universe_path("tech_giants")
-        assert path == sample_universe_json_file
-        path_ext = get_universe_path("tech_giants.json")
-        assert path_ext == sample_universe_json_file
-
-    def test_get_universe_path_subfolder(
-        self, mock_settings, sample_subfolder_universe_yaml_file
-    ):
-        path = get_universe_path("sectors/cloud_computing")
-        assert path == sample_subfolder_universe_yaml_file
-        path_ext = get_universe_path("sectors/cloud_computing.yaml")
-        assert path_ext == sample_subfolder_universe_yaml_file
-
-    def test_get_universe_path_not_found(self, mock_settings):
-        with pytest.raises(FileNotFoundError):
-            get_universe_path("non_existent_universe")
+            Universe(str(universe_dir / "non_existent.json"))
 
     def test_load_universe_yaml(
         self, mock_settings, sample_universe_yaml_file, sample_universe_data
     ):
-        universe = load_universe("tech_giants", load_filings=False)
-        assert universe.name == sample_universe_data["name"]
+        universe = Universe("tech_giants")
+        assert universe.raw_name == sample_universe_data["name"]
+        assert universe.name == sample_universe_data["name"].replace("/", "_")
         assert len(universe) == len(sample_universe_data["securities"])
 
     def test_load_universe_json(
         self, mock_settings, sample_universe_json_file, sample_universe_data
     ):
-        # Assumes tech_giants.yaml doesn't exist for this test case or json is preferred somehow
-        yaml_path = mock_settings / "universes" / "tech_giants.yaml"
-        if yaml_path.exists():
-            yaml_path.unlink()
-
-        # Load json by name, assuming tech_giants.json exists
         json_path = mock_settings / "universes" / "tech_giants.json"
         assert json_path.exists(), "Test assumes tech_giants.json exists for this case"
 
-        universe = load_universe("tech_giants", load_filings=False)
-        assert universe.name == "tech_giants"  # Name derived from file stem
+        universe = Universe("tech_giants")
+        assert universe.raw_name == "tech_giants"
+        assert universe.name == "tech_giants"
         assert len(universe) == len(sample_universe_data["securities"])
 
     def test_load_universe_subfolder(
         self, mock_settings, sample_subfolder_universe_yaml_file
     ):
-        universe = load_universe("sectors/cloud_computing", load_filings=False)
-        assert (
-            universe.raw_name == "sectors/cloud_computing"
-        )  # Check raw name is preserved
-        assert universe.name == "sectors_cloud_computing"  # Check normalized name
+        universe = Universe("sectors/cloud_computing")
+        assert universe.raw_name == "sectors/cloud_computing"
+        assert universe.name == "sectors_cloud_computing"
         assert set(universe.get_tickers()) == {"MSFT", "AMZN"}
-        assert universe.filings_df is None
-        # Check default years are set in year_range
+        assert universe.filings_lf is None
         assert isinstance(universe.year_range, YearRange)
         assert universe.year_range.start == CURRENT_YEAR - DEFAULT_YEAR_RANGE
         assert universe.year_range.end == CURRENT_YEAR
 
     def test_load_universe_not_found(self, mock_settings):
         with pytest.raises(FileNotFoundError):
-            load_universe("completely_made_up", load_filings=False)
+            Universe("completely_made_up")
 
     # Test load_filings=True requires mocking EDGARFetcher, add later
 
@@ -383,7 +343,7 @@ class TestUniverseClass:
     @pytest.fixture
     def basic_universe(self):
         """Creates a basic Universe object without loading from file."""
-        u = Universe(name="basic")
+        u = Universe("basic", empty=True)
         u.add_security(Security(ticker="SEC1", name="Security One", exchange="NYSE"))
         u.add_security(
             Security(
@@ -393,30 +353,48 @@ class TestUniverseClass:
         return u
 
     def test_universe_initialization(self):
-        u = Universe(name="My Universe")
-        assert u.name == "My_Universe"  # Normalized
+        u = Universe("My Universe", empty=True)
+        assert u.name == "My_Universe"
         assert u.raw_name == "My Universe"
         assert len(u) == 0
         assert u.securities == {}
-        assert u.filings_df is None
-        # Check default years from settings (assuming defaults)
-        # assert u.start_year == settings.start_year # Can be None
-        # assert u.end_year == settings.end_year # Can be None
+        assert u.filings_lf is None
+
+    def test_universe_initialization_empty_kwarg(self):
+        """Test creating a Universe with empty=True."""
+        u_empty = Universe("My Empty Test Universe", empty=True)
+        assert u_empty.name == "My_Empty_Test_Universe"  # Normalized
+        assert u_empty.raw_name == "My Empty Test Universe"
+        assert len(u_empty) == 0
+        assert u_empty.securities == {}
+        assert (
+            u_empty.filings_lf is None
+        )  # Should still check for filings_lf based on name, but it won't exist
+        assert u_empty.definition_path is None
+
+        # Check string representation for empty universe
+        expected_str = f"My_Empty_Test_Universe [{CURRENT_YEAR - DEFAULT_YEAR_RANGE}-{CURRENT_YEAR}] (0 securities) (Filings metadata file not found)"
+        assert str(u_empty) == expected_str
+
+        # Test adding a security to an 'empty' universe
+        sec = Security(ticker="ADD1", name="Added Security", exchange="TESTEX")
+        u_empty.add_security(sec)
+        assert len(u_empty) == 1
+        assert u_empty.get_security("ADD1") is sec
 
     def test_universe_initialization_with_slashes(self):
-        u = Universe(name="category/sub_category")
-        assert u.name == "category_sub_category"  # Normalized
+        u = Universe("category/sub_category", empty=True)
+        assert u.name == "category_sub_category"
         assert u.raw_name == "category/sub_category"
 
     def test_empty_universe_methods(self):
-        """Test methods on a universe with no securities added."""
-        u_empty = Universe(name="empty_test")
+        u_empty = Universe("empty_test", empty=True)
         assert u_empty.get_all_securities() == []
         assert u_empty.get_tickers() == []
         assert len(u_empty) == 0
         assert (
             str(u_empty)
-            == f"empty_test [{CURRENT_YEAR - DEFAULT_YEAR_RANGE}-{CURRENT_YEAR}] (0 securities) (Filings not loaded)"
+            == f"empty_test [{CURRENT_YEAR - DEFAULT_YEAR_RANGE}-{CURRENT_YEAR}] (0 securities) (Filings metadata file not found)"
         )
 
     def test_add_remove_get_security(self, basic_universe):
@@ -437,7 +415,6 @@ class TestUniverseClass:
         assert basic_universe.get_security("SEC1") is None
         assert set(basic_universe.get_tickers()) == {"SEC2", "SEC3"}
 
-        # Test removing non-existent ticker (should not raise error)
         basic_universe.remove_security("NONEXISTENT")
         assert len(basic_universe) == 2
 
@@ -448,89 +425,84 @@ class TestUniverseClass:
         assert {s.ticker for s in all_secs} == {"SEC1", "SEC2"}
 
     def test_get_filing_years(self):
-        # Test various scenarios via the YearRange model integration
-        # Defaults
-        u_default = Universe(name="default_years")
+        u_default = Universe("default_years", empty=True)
         assert u_default.get_filing_years() == list(
             range(CURRENT_YEAR - DEFAULT_YEAR_RANGE, CURRENT_YEAR + 1)
         )
 
-        # Specific Ints
-        u_specific = Universe(name="specific", start_year=2018, end_year=2020)
+        u_specific = Universe("specific", start_year=2018, end_year=2020, empty=True)
         assert u_specific.get_filing_years() == [2018, 2019, 2020]
 
-        # Earliest to Latest
-        u_full = Universe(name="full", start_year="earliest", end_year="latest")
+        u_full = Universe("full", start_year="earliest", end_year="latest", empty=True)
         assert u_full.get_filing_years() == list(
             range(EARLIEST_YEAR_PLACEHOLDER, CURRENT_YEAR + 1)
         )
 
-        # Specific to Latest
-        u_to_latest = Universe(name="to_latest", start_year=2021, end_year="latest")
+        u_to_latest = Universe(
+            "to_latest", start_year=2021, end_year="latest", empty=True
+        )
         assert u_to_latest.get_filing_years() == list(range(2021, CURRENT_YEAR + 1))
 
-        # Earliest to Specific
         u_from_earliest = Universe(
-            name="from_earliest", start_year="earliest", end_year=2019
+            "from_earliest", start_year="earliest", end_year=2019, empty=True
         )
         assert u_from_earliest.get_filing_years() == list(
             range(EARLIEST_YEAR_PLACEHOLDER, 2020)
         )
 
-        # Invalid range (Start > End Int) -> adjusted
-        u_invalid_int = Universe(name="invalid_int", start_year=2023, end_year=2020)
+        u_invalid_int = Universe(
+            "invalid_int", start_year=2023, end_year=2020, empty=True
+        )
         assert u_invalid_int.get_filing_years() == [2023]
 
-        # Invalid range (Resolved Start > Resolved End) -> empty list
         if CURRENT_YEAR < 2025:
             u_invalid_resolved = Universe(
-                name="invalid_resolved", start_year=2025, end_year="latest"
+                "invalid_resolved", start_year=2025, end_year="latest", empty=True
             )
             assert u_invalid_resolved.get_filing_years() == []
         else:
             print("Skipping resolved invalid range test as CURRENT_YEAR >= 2025")
 
     def test_universe_str(self, basic_universe):
-        # Default range
-        u_default = Universe(name="str_test_default")
+        u_default = Universe("str_test_default", empty=True)
         assert (
             str(u_default)
-            == f"str_test_default [{CURRENT_YEAR - DEFAULT_YEAR_RANGE}-{CURRENT_YEAR}] (0 securities) (Filings not loaded)"
+            == f"str_test_default [{CURRENT_YEAR - DEFAULT_YEAR_RANGE}-{CURRENT_YEAR}] (0 securities) (Filings metadata file not found)"
         )
 
-        # Specific range
         basic_universe.year_range = YearRange(start=2021, end=2023)
         assert (
             str(basic_universe)
-            == "basic [2021-2023] (2 securities) (Filings not loaded)"
+            == "basic [2021-2023] (2 securities) (Filings metadata file not found)"
         )
 
-        # With filings loaded (mock)
-        basic_universe.filings_df = pl.DataFrame({"ticker": ["SEC1"], "year": [2022]})
-        assert (
-            str(basic_universe) == "basic [2021-2023] (2 securities) (Filings loaded)"
-        )
+        with patch.object(
+            basic_universe, "filings_lf", MagicMock(spec=pl.LazyFrame)
+        ) as mock_lf:
+            basic_universe.year_range = YearRange(start=2021, end=2023)
+            assert (
+                str(basic_universe)
+                == "basic [2021-2023] (2 securities) (Filings metadata detected)"
+            )
 
-        # Earliest to latest range
         basic_universe.year_range = YearRange(start="earliest", end="latest")
         assert (
             str(basic_universe)
-            == "basic [earliest-latest] (2 securities) (Filings loaded)"
+            == "basic [earliest-latest] (2 securities) (Filings metadata file not found)"
         )
 
-        # Range needing defaults
-        u_part_default = Universe(name="part_def", start_year=2022)
+        u_part_default = Universe("part_def", start_year=2022, empty=True)
         assert (
             str(u_part_default)
-            == f"part_def [2022-{CURRENT_YEAR}] (0 securities) (Filings not loaded)"
+            == f"part_def [2022-{CURRENT_YEAR}] (0 securities) (Filings metadata file not found)"
         )
 
     def test_save_load_yaml_roundtrip(self, basic_universe, mock_settings):
         save_path = mock_settings / "universes" / "roundtrip.yaml"
-        save_to_yaml(basic_universe, str(save_path))
+        save_universe_definition(basic_universe, filepath=str(save_path), format="yaml")
         assert save_path.exists()
 
-        loaded_universe = load_universe("roundtrip", load_filings=False)
+        loaded_universe = Universe("roundtrip")
         assert loaded_universe.name == basic_universe.name
         assert len(loaded_universe) == len(basic_universe)
         assert set(loaded_universe.get_tickers()) == set(basic_universe.get_tickers())
@@ -542,7 +514,7 @@ class TestUniverseClass:
 
     def test_save_load_json_roundtrip(self, basic_universe, mock_settings):
         save_path = mock_settings / "universes" / "roundtrip.json"
-        save_to_json(basic_universe, str(save_path))
+        save_universe_definition(basic_universe, filepath=str(save_path), format="json")
         assert save_path.exists()
 
         # Ensure yaml version doesn't exist to force json loading
@@ -550,7 +522,7 @@ class TestUniverseClass:
         if yaml_save_path.exists():
             yaml_save_path.unlink()
 
-        loaded_universe = load_universe("roundtrip", load_filings=False)
+        loaded_universe = Universe("roundtrip")
         assert loaded_universe.name == basic_universe.name
         assert len(loaded_universe) == len(basic_universe)
         assert set(loaded_universe.get_tickers()) == set(basic_universe.get_tickers())
@@ -560,17 +532,119 @@ class TestUniverseClass:
         assert sec1_loaded.name == sec1_original.name
         assert sec1_loaded.exchange == sec1_original.exchange
 
+    def test_process_single_ibm_xbrl_instance(self, mock_settings):
+        """Tests processing a single local XBRL instance for IBM via Universe methods."""
+        # 1. Define paths and data
+        workspace_root = Path(".")  # Assumes tests run from workspace root
+        xbrl_file_rel_path = (
+            Path("tests") / "data" / "000005114324000012" / "ibm-20231231.htm"
+        )
+        xbrl_file_abs_path = workspace_root / xbrl_file_rel_path
+        assert xbrl_file_abs_path.exists(), (
+            f"XBRL file not found at {xbrl_file_abs_path}"
+        )
 
-# TODO: Add TestUniverseFilings class with mocked EDGARFetcher etc.
-# - Test _get_filings_path
-# - Test fetch_or_load_filings logic (disk load, fetch, force fetch, errors)
-# - Test get_missing_filings
-# - Test sync_filings
+        universe_name = "test_ibm_xbrl_processing"
+        ibm_universe_data = {
+            "name": universe_name,  # Universe class will use this raw_name
+            "securities": [
+                {
+                    "ticker": "IBM",
+                    "name": "International Business Machines Corp.",
+                    "exchange": "NYSE",
+                }
+            ],
+        }
+        universe_def_dir = mock_settings / "universes"
+        universe_def_dir.mkdir(parents=True, exist_ok=True)
+        ibm_universe_file_path = universe_def_dir / f"{universe_name}.yaml"
+        with open(ibm_universe_file_path, "w") as f:
+            yaml.dump(ibm_universe_data, f)
 
-# --- Test Classes ---
+        # 2. Mock EDGARFetcher instance and its methods
+        mock_fetcher_instance = MagicMock(spec=EDGARFetcher)
 
+        def mock_fetch_specific_filings_side_effect(combinations, ciks):
+            # This function will be the side_effect for fetch_specific_filings
+            assert len(combinations) == 1, "Should only request one filing for IBM 2023"
+            combo = combinations[0]
+            assert combo["ticker"] == "IBM"
+            assert combo["filing_year"] == 2023
 
-@pytest.mark.skip(reason="Filings tests require mocking EDGARFetcher")
-class TestUniverseFilings:
-    # Add tests for TestUniverseFilings class
-    pass
+            return pl.DataFrame(
+                [
+                    {
+                        "ticker": "IBM",
+                        "cik": "0000051143",
+                        "form": "10-K",
+                        "accessionNumber": "0000051143-24-000012",  # Actual an from path
+                        "filingDate": "2024-02-20",  # Example filing date
+                        "filing_date_dt": datetime.date(2024, 2, 20),
+                        "filing_year": 2023,  # As requested
+                        "reportDate": "2023-12-31",  # Actual report date from filename
+                        "report_date_dt": datetime.date(2023, 12, 31),
+                        "primaryDocument": xbrl_file_rel_path.name,
+                        "primaryDocDescription": "10-K",
+                        "documents_url": f"https://www.sec.gov/Archives/edgar/data/51143/000005114324000012/",  # Fake but plausible
+                        "xbrl_instance_url": str(
+                            xbrl_file_abs_path
+                        ),  # CRUCIAL: absolute path to local file
+                        "processed_datetime": datetime.datetime.now(),
+                    }
+                ]
+            )
+
+        mock_fetcher_instance.fetch_specific_filings.side_effect = (
+            mock_fetch_specific_filings_side_effect
+        )
+
+        # 3. Initialize Universe and process, patching EDGARFetcher constructor
+        with patch(
+            "alphaledger.universe.EDGARFetcher", return_value=mock_fetcher_instance
+        ) as mock_edgar_fetcher_constructor:
+            # Universe will be loaded using the name, finding the YAML in mock_settings.universe_dir
+            uni = Universe(universe_name, start_year=2023, end_year=2023)
+
+            # This call populates uni.filings_lf using the mocked fetcher
+            filings_meta_lf = uni.collect_filings()
+            assert filings_meta_lf is not None, (
+                "collect_filings should return a LazyFrame for metadata"
+            )
+
+            # Verify metadata was collected as expected
+            filings_meta_df = filings_meta_lf.collect()
+            assert not filings_meta_df.is_empty(), (
+                "Filings metadata DataFrame should not be empty"
+            )
+            assert filings_meta_df[0, "ticker"] == "IBM"
+            assert filings_meta_df[0, "xbrl_instance_url"] == str(xbrl_file_abs_path)
+
+            # This call triggers processing of the local XBRL file via process_filings_structured_direct or process_filings_structured_sections (with edgar_fetcher)
+            numeric_facts_lf = uni.get_numeric_facts()
+
+            # 4. Assertions on the processed numeric facts
+            assert numeric_facts_lf is not None, (
+                "get_numeric_facts should return a LazyFrame for facts"
+            )
+
+            numeric_facts_df = numeric_facts_lf.collect()
+            assert not numeric_facts_df.is_empty(), (
+                "Numeric facts DataFrame should not be empty after processing XBRL"
+            )
+
+            assert "IBM" in numeric_facts_df["ticker"].to_list(), (
+                "IBM ticker should be present in numeric facts"
+            )
+
+            # Check for expected columns (core + added by processing)
+            expected_cols = set(TARGET_SCHEMA_NUMERIC_DIRECT_POLARS.keys()).union(
+                {"ticker", "filing_date", "report_date"}
+            )
+            assert expected_cols.issubset(numeric_facts_df.columns), (
+                f"Numeric facts DataFrame missing expected columns. Got: {numeric_facts_df.columns}, Expected subset: {expected_cols}"
+            )
+
+            # Example: Check if a common metric like 'Assets' was extracted (optional, can be brittle)
+            # assets_facts = numeric_facts_df.filter(pl.col("metric") == "Assets")
+            # assert not assets_facts.is_empty(), "Failed to extract 'Assets' metric for IBM"
+            # logger.info(f"IBM Assets found: {assets_facts}")

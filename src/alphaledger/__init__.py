@@ -121,6 +121,15 @@ def process_universe_xbrl() -> None:
     universe.process_xbrl()
 
 
+def assistant():
+    """
+    Start the assistant.
+    """
+    from alphaledger.tui import AssistantApp
+
+    AssistantApp().run()
+
+
 def patch_cyd_taxonomy():
     """
     Add missing CYD taxonomy namespaces to py‑xbrl so that the parser

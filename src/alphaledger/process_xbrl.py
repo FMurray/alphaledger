@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 
 from alphaledger import get_logger
+from alphaledger.sec import EDGARFetcher
 
 logger = get_logger(__name__)
 
@@ -227,7 +228,10 @@ class IXBRLDocument:
         row_base = {}
         # Basic Info
         row_base["concept_name"] = fact.concept.name
-        row_base["concept_namespace"] = fact.concept.schema_url.split("/")[-2]
+        if fact.concept.schema_url:
+            row_base["concept_namespace"] = fact.concept.schema_url.split("/")[-2]
+        else:
+            row_base["concept_namespace"] = None
         row_base["fact_type"] = type(fact).__name__
         row_base["section_name"] = section_title
 
@@ -448,43 +452,62 @@ class IXBRLDocumentParser:
         parsers_to_try = ["lxml", "html5lib", "html.parser"]  # Prioritize lxml/html5lib
         soup = None
         working_parser = None
+        # Define the sets of tag names to try
+        namespaced_fact_tags = ["ix:nonfraction", "ix:nonnumeric"]
+        non_namespaced_fact_tags = ["nonfraction", "nonnumeric"]
+        fact_tags_to_use = namespaced_fact_tags  # Default to namespaced
+
         for parser_name in parsers_to_try:
             try:
                 logger.info(f"Attempting to parse with '{parser_name}'...")
                 temp_soup = BeautifulSoup(content, parser_name)
                 # Test if it finds namespaced tags and IDs correctly
-                test_tags = temp_soup.find_all(["ix:nonfraction", "ix:nonnumeric"])
+                test_tags = temp_soup.find_all(namespaced_fact_tags)
                 if test_tags:
                     logger.info(
-                        f"Parser '{parser_name}' found {len(test_tags)} ix:non* tags."
+                        f"Parser '{parser_name}' found {len(test_tags)} namespaced ix:non* tags."
                     )
                     ids_found = [tag.get("id") for tag in test_tags if tag.get("id")]
                     if ids_found:
                         logger.info(
-                            f"Parser '{parser_name}' found {len(ids_found)} tags with IDs. Using this parser."
-                        )
-                        logger.debug(
-                            f"Sample IDs found by '{parser_name}': {ids_found[:5]}"
+                            f"Parser '{parser_name}' found {len(ids_found)} namespaced tags with IDs. Using this parser and namespaced tags."
                         )
                         soup = temp_soup
                         working_parser = parser_name
-                        break  # Found a working parser
+                        fact_tags_to_use = namespaced_fact_tags
+                        break  # Found a working parser with namespaced tags
                     else:
                         logger.warning(
-                            f"Parser '{parser_name}' found ix:non* tags but failed to extract IDs."
+                            f"Parser '{parser_name}' found namespaced ix:non* tags but failed to extract IDs from them."
                         )
-                else:
-                    # Check for lowercase tags as a fallback
-                    test_tags_lower = temp_soup.find_all(["nonfraction", "nonnumeric"])
+                else:  # Namespaced tags not found, try non-namespaced
+                    logger.info(
+                        f"Parser '{parser_name}' did not find namespaced ix:non* tags. Trying non-namespaced..."
+                    )
+                    test_tags_lower = temp_soup.find_all(non_namespaced_fact_tags)
                     if test_tags_lower:
-                        logger.warning(
-                            f"Parser '{parser_name}' did not find namespaced 'ix:non*' tags, but found {len(test_tags_lower)} lowercase tags."
+                        logger.info(
+                            f"Parser '{parser_name}' found {len(test_tags_lower)} non-namespaced non* tags."
                         )
+                        ids_found_lower = [
+                            tag.get("id") for tag in test_tags_lower if tag.get("id")
+                        ]
+                        if ids_found_lower:
+                            logger.info(
+                                f"Parser '{parser_name}' found {len(ids_found_lower)} non-namespaced tags with IDs. Using this parser and non-namespaced tags."
+                            )
+                            soup = temp_soup
+                            working_parser = parser_name
+                            fact_tags_to_use = non_namespaced_fact_tags
+                            break  # Found a working parser with non-namespaced tags
+                        else:
+                            logger.warning(
+                                f"Parser '{parser_name}' found non-namespaced non* tags but failed to extract IDs from them."
+                            )
                     else:
                         logger.warning(
-                            f"Parser '{parser_name}' did not find any 'ix:non*' or lowercase fact tags."
+                            f"Parser '{parser_name}' did not find any namespaced 'ix:non*' or non-namespaced 'non*' fact tags."
                         )
-
             except Exception as e:
                 logger.warning(f"Failed to parse or test with '{parser_name}': {e}")
 
@@ -493,14 +516,18 @@ class IXBRLDocumentParser:
                 "Could not effectively parse HTML with any available parser ('lxml', 'html5lib', 'html.parser'). Ensure parsers are installed."
             )
             return IXBRLDocument(sections=[])
-        logger.info(f"Using HTML parser: '{working_parser}'")
+        logger.info(
+            f"Using HTML parser: '{working_parser}' and fact tags: {fact_tags_to_use}"
+        )
 
         # --- Detailed Debugging ---
-        logger.info("Scanning parsed HTML for fact tags...")
+        logger.info(f"Scanning parsed HTML for fact tags using: {fact_tags_to_use}...")
         facts_found_in_html = 0
         matched_facts_count = 0
         unmatched_ids = []
-        for tag in soup.find_all(["ix:nonfraction", "ix:nonnumeric"]):
+        for tag in soup.find_all(
+            fact_tags_to_use
+        ):  # Use the determined fact_tags_to_use
             facts_found_in_html += 1
             tag_id = tag.get("id")
             tag_name_attr = tag.get("name")  # Get name attribute from HTML tag
@@ -615,13 +642,10 @@ class IXBRLDocumentParser:
                     return
 
                 # Check for facts
-                elif node.name in ["ix:nonfraction", "ix:nonnumeric"]:
+                elif (
+                    node.name in fact_tags_to_use
+                ):  # Use the determined fact_tags_to_use
                     fact_id = node.get("id")
-                    # --- DEBUG: Log HTML Fact ID ---
-                    logger.info(
-                        f"[process_node] Found HTML fact tag with id: {fact_id}"
-                    )
-                    # --------------------------------
                     if fact_id and fact_id in self.facts_by_id:
                         fact_obj = self.facts_by_id[fact_id]
                         logger.debug(
@@ -1322,7 +1346,7 @@ def fetch_filing_with_xbrl(
             acc_no_formatted = accession_number.replace("-", "")
 
             # Construct URL to the filing index page
-            filing_url = f"https://www.sec.gov/Archives/edgar/data/{cik_formatted}/{acc_no_formatted}/{accession_number}-index.html"
+            filing_url = f"https://www.sec.gov/ /edgar/data/{cik_formatted}/{acc_no_formatted}/{accession_number}-index.html"
 
             # Use the cache to get the index page
             index_content = cache.get(filing_url).decode("utf-8")
@@ -1441,134 +1465,130 @@ def save_facts_to_delta(
     df.write.format("delta").mode("append").saveAsTable(table_name)
 
 
-def process_filings_structured(
-    filings_df: pl.DataFrame,
-) -> Tuple[pl.DataFrame, pl.DataFrame]:
-    """
-    Processes a list of XBRL filing URLs, parses the HTML structure,
-    extracts numeric and text facts linked to document sections,
-    and aggregates them into separate Polars DataFrames.
+# def process_filings_structured_sections(
+#     filings_df: pl.DataFrame, edgar_fetcher: EDGARFetcher
+# ) -> Tuple[pl.DataFrame, pl.DataFrame]:
+#     """
+#     Processes a list of XBRL filing URLs, parses the HTML structure,
+#     extracts numeric and text facts linked to document sections,
+#     and aggregates them into separate Polars DataFrames.
 
-    Args:
-        filings_df: DataFrame containing 'ticker', 'xbrl_instance_url',
-                    'filingDate', and 'reportDate' columns.
+#     Args:
+#         filings_df: DataFrame containing 'ticker', 'xbrl_instance_url',
+#                     'filingDate', and 'reportDate' columns.
+#         edgar_fetcher: An instance of EDGARFetcher to handle SEC interactions.
 
-    Returns:
-        A tuple containing two Polars DataFrames:
-        1. Aggregated numeric facts DataFrame (schema includes ticker, dates, section_name).
-        2. Aggregated text facts DataFrame (schema includes ticker, dates, section_name).
-    """
-    from xbrl.cache import HttpCache
-    from xbrl.instance import XbrlParser
+#     Returns:
+#         A tuple containing two Polars DataFrames:
+#         1. Aggregated numeric facts DataFrame (schema includes ticker, dates, section_name).
+#         2. Aggregated text facts DataFrame (schema includes ticker, dates, section_name).
+#     """
+#     logger.info("[process_filing_urls_structured] Starting structured fact extraction.")
 
-    logger.info("[process_filing_urls_structured] Starting structured fact extraction.")
-    cache = HttpCache(cache_dir="./cache")
+#     # Use the original schemas that include section_name
+#     numeric_schema_structured_with_ticker = {
+#         **TARGET_SCHEMA_NUMERIC_POLARS,
+#         "ticker": pl.Utf8,
+#     }
+#     text_schema_structured_with_ticker = {
+#         **TARGET_SCHEMA_TEXT_POLARS,
+#         "ticker": pl.Utf8,
+#     }
 
-    # Use the original schemas that include section_name
-    numeric_schema_structured_with_ticker = {
-        **TARGET_SCHEMA_NUMERIC_POLARS,
-        "ticker": pl.Utf8,
-    }
-    text_schema_structured_with_ticker = {
-        **TARGET_SCHEMA_TEXT_POLARS,
-        "ticker": pl.Utf8,
-    }
+#     all_numeric_facts_df = pl.DataFrame(schema=numeric_schema_structured_with_ticker)
+#     all_text_facts_df = pl.DataFrame(schema=text_schema_structured_with_ticker)
 
-    all_numeric_facts_df = pl.DataFrame(schema=numeric_schema_structured_with_ticker)
-    all_text_facts_df = pl.DataFrame(schema=text_schema_structured_with_ticker)
+#     try:
+#         # Use the cache from edgar_fetcher for doc_parser
+#         doc_parser = IXBRLDocumentParser(edgar_fetcher.http_cache)
+#     except ImportError:
+#         logger.error("py-xbrl package not installed. Run: pip install py-xbrl")
+#         return all_numeric_facts_df, all_text_facts_df
 
-    try:
-        parser = XbrlParser(cache)
-        doc_parser = IXBRLDocumentParser(cache)  # Need the document parser here
-    except ImportError:
-        logger.error("py-xbrl package not installed. Run: pip install py-xbrl")
-        return all_numeric_facts_df, all_text_facts_df
+#     # Check input columns
+#     # Use the _dt columns for dates
+#     expected_input_cols = {
+#         "ticker",
+#         "xbrl_instance_url",
+#         "filing_date_dt",
+#         "report_date_dt",
+#     }
+#     if not expected_input_cols.issubset(filings_df.columns):
+#         logger.error(
+#             f"[process_filing_urls_structured] Input DataFrame missing expected columns. Need: {expected_input_cols}, Got: {filings_df.columns}. Returning empty DataFrames."
+#         )
+#         return all_numeric_facts_df, all_text_facts_df
 
-    # Check input columns
-    # Use the _dt columns for dates
-    expected_input_cols = {
-        "ticker",
-        "xbrl_instance_url",
-        "filing_date_dt",
-        "report_date_dt",
-    }
-    if not expected_input_cols.issubset(filings_df.columns):
-        logger.error(
-            f"[process_filing_urls_structured] Input DataFrame missing expected columns. Need: {expected_input_cols}, Got: {filings_df.columns}. Returning empty DataFrames."
-        )
-        return all_numeric_facts_df, all_text_facts_df
+#     processed_count = 0
+#     for record in filings_df.iter_rows(named=True):
+#         url = record.get("xbrl_instance_url")
+#         ticker = record.get("ticker")
+#         # Extract dates using the _dt columns
+#         filing_date = record.get("filing_date_dt")
+#         report_date = record.get("report_date_dt")
 
-    processed_count = 0
-    for record in filings_df.iter_rows(named=True):
-        url = record.get("xbrl_instance_url")
-        ticker = record.get("ticker")
-        # Extract dates using the _dt columns
-        filing_date = record.get("filing_date_dt")
-        report_date = record.get("report_date_dt")
+#         if not url or not ticker:
+#             logger.warning(
+#                 f"[structured] Skipping record due to missing URL or Ticker: {record}"
+#             )
+#             continue
 
-        if not url or not ticker:
-            logger.warning(
-                f"[structured] Skipping record due to missing URL or Ticker: {record}"
-            )
-            continue
+#         try:
+#             # 1. Parse the XBRL instance using EDGARFetcher
+#             inst = edgar_fetcher.parse_filing_xbrl(record)
+#             if not inst:
+#                 logger.warning(
+#                     f"[structured] Skipping {url} (Ticker: {ticker}): Instance parsing failed via EDGARFetcher."
+#                 )
+#                 continue
 
-        try:
-            # 1. Parse the XBRL instance
-            inst = parser.parse_instance(url)
-            if not inst:
-                logger.warning(
-                    f"[structured] Skipping {url} (Ticker: {ticker}): Instance parsing failed."
-                )
-                continue
+#             # 2. Parse the HTML document structure using the instance
+#             document = doc_parser.parse(xbrl_instance=inst)
 
-            # 2. Parse the HTML document structure using the instance
-            # This is the key difference: uses IXBRLDocumentParser
-            document = doc_parser.parse(xbrl_instance=inst)
+#             # 3. Create DataFrames from the parsed document structure
+#             numeric_df = document.to_numeric_dataframe(
+#                 filing_date=filing_date, report_date=report_date
+#             )
+#             text_df = document.to_text_dataframe(
+#                 filing_date=filing_date, report_date=report_date
+#             )
 
-            # 3. Create DataFrames from the parsed document structure
-            numeric_df = document.to_numeric_dataframe(
-                filing_date=filing_date, report_date=report_date
-            )
-            text_df = document.to_text_dataframe(
-                filing_date=filing_date, report_date=report_date
-            )
+#             # 4. Add ticker column before concatenating
+#             if not numeric_df.is_empty():
+#                 numeric_df = numeric_df.with_columns(pl.lit(ticker).alias("ticker"))
+#             if not text_df.is_empty():
+#                 text_df = text_df.with_columns(pl.lit(ticker).alias("ticker"))
 
-            # 4. Add ticker column before concatenating
-            if not numeric_df.is_empty():
-                numeric_df = numeric_df.with_columns(pl.lit(ticker).alias("ticker"))
-            if not text_df.is_empty():
-                text_df = text_df.with_columns(pl.lit(ticker).alias("ticker"))
+#             # 5. Concatenate into respective accumulators
+#             if not numeric_df.is_empty():
+#                 all_numeric_facts_df = pl.concat(
+#                     [all_numeric_facts_df, numeric_df], how="vertical_relaxed"
+#                 )
+#             if not text_df.is_empty():
+#                 all_text_facts_df = pl.concat(
+#                     [all_text_facts_df, text_df], how="vertical_relaxed"
+#                 )
 
-            # 5. Concatenate into respective accumulators
-            if not numeric_df.is_empty():
-                all_numeric_facts_df = pl.concat(
-                    [all_numeric_facts_df, numeric_df], how="vertical_relaxed"
-                )
-            if not text_df.is_empty():
-                all_text_facts_df = pl.concat(
-                    [all_text_facts_df, text_df], how="vertical_relaxed"
-                )
+#             processed_count += 1
 
-            processed_count += 1
+#         except Exception as e:
+#             logger.error(
+#                 f"[structured] ERROR processing {url} (Ticker: {ticker}): {e}",
+#                 exc_info=True,
+#             )
+#             # Continue to next filing
 
-        except Exception as e:
-            logger.error(
-                f"[structured] ERROR processing {url} (Ticker: {ticker}): {e}",
-                exc_info=True,
-            )
-            # Continue to next filing
+#     logger.info(
+#         f"[process_filing_urls_structured] Processing complete. Processed {processed_count} filings."
+#     )
+#     logger.info(f"[structured] Final Numeric DF shape: {all_numeric_facts_df.shape}")
+#     logger.info(f"[structured] Final Text DF shape: {all_text_facts_df.shape}")
 
-    logger.info(
-        f"[process_filing_urls_structured] Processing complete. Processed {processed_count} filings."
-    )
-    logger.info(f"[structured] Final Numeric DF shape: {all_numeric_facts_df.shape}")
-    logger.info(f"[structured] Final Text DF shape: {all_text_facts_df.shape}")
-
-    return all_numeric_facts_df, all_text_facts_df
+#     return all_numeric_facts_df, all_text_facts_df
 
 
-def process_filings_structured(
-    filings_df: pl.DataFrame,
+def process_filings_structured_direct(
+    filings_df: pl.DataFrame, edgar_fetcher: EDGARFetcher
 ) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """
     Processes a list of XBRL filing URLs, extracts numeric and text facts
@@ -1578,17 +1598,14 @@ def process_filings_structured(
     Args:
         filings_df: DataFrame containing 'ticker', 'xbrl_instance_url',
                     'filingDate', and 'reportDate' columns.
+        edgar_fetcher: An instance of EDGARFetcher to handle SEC interactions.
 
     Returns:
         A tuple containing two Polars DataFrames:
         1. Aggregated numeric facts DataFrame (schema includes ticker, dates, NO section_name).
         2. Aggregated text facts DataFrame (schema includes ticker, dates, NO section_name).
     """
-    from xbrl.cache import HttpCache
-    from xbrl.instance import XbrlParser
-
     logger.info("[process_filing_urls_direct] Starting direct fact extraction.")
-    cache = HttpCache(cache_dir="./cache")
 
     # Use the DIRECT schemas (no section_name)
     numeric_schema_direct_with_ticker = {
@@ -1602,12 +1619,6 @@ def process_filings_structured(
 
     all_numeric_facts_df = pl.DataFrame(schema=numeric_schema_direct_with_ticker)
     all_text_facts_df = pl.DataFrame(schema=text_schema_direct_with_ticker)
-
-    try:
-        parser = XbrlParser(cache)
-    except ImportError:
-        logger.error("py-xbrl package not installed. Run: pip install py-xbrl")
-        return all_numeric_facts_df, all_text_facts_df  # Return empty DFs
 
     # Check input columns
     # Use the _dt columns for dates
@@ -1638,11 +1649,12 @@ def process_filings_structured(
             continue
 
         try:
-            # 1. Parse the XBRL instance
-            inst = parser.parse_instance(url)
+            # 1. Parse the XBRL instance using EDGARFetcher
+            inst = edgar_fetcher.parse_filing_xbrl(record)
+
             if not inst:
                 logger.warning(
-                    f"[direct] Skipping {url} (Ticker: {ticker}): Instance parsing failed."
+                    f"[direct] Skipping {url} (Ticker: {ticker}): Instance parsing failed via EDGARFetcher."
                 )
                 continue
 
@@ -1685,97 +1697,103 @@ def process_filings_structured(
     return all_numeric_facts_df, all_text_facts_df
 
 
-if __name__ == "__main__":
-    # Note: This example usage might need adjustment depending on how Universe evolves.
-    # It currently assumes a direct call to get_filings() and then processing.
-    # The new Universe pattern would likely involve get_numeric_facts().
-    from alphaledger.universe import Universe
-    from alphaledger.config import settings
+# if __name__ == "__main__":
+#     # Note: This example usage might need adjustment depending on how Universe evolves.
+#     # It currently assumes a direct call to get_filings() and then processing.
+#     # The new Universe pattern would likely involve get_numeric_facts().
+#     from alphaledger.universe import Universe
+#     from alphaledger.config import settings
 
-    # Use basicConfig for simplicity in example, or configure logger as needed
-    import logging
+#     # Use basicConfig for simplicity in example, or configure logger as needed
+#     import logging
 
-    logging.basicConfig(level=logging.INFO)
-    # logger = get_logger(__name__) # Use project's logger if available
+#     logging.basicConfig(level=logging.INFO)
+#     # logger = get_logger(__name__) # Use project's logger if available
 
-    try:
-        # Example: Use a specific universe name defined in your settings or environment
-        universe_name = settings.universe_name  # Or replace with "your_universe_name"
-        logger.info(f"Loading universe: {universe_name}")
-        universe = Universe(universe_name)
+#     try:
+#         # Example: Use a specific universe name defined in your settings or environment
+#         universe_name = settings.universe_name  # Or replace with "your_universe_name"
+#         logger.info(f"Loading universe: {universe_name}")
+#         universe = Universe(universe_name)
 
-        # Ensure metadata is available
-        logger.info("Ensuring filings metadata is available...")
-        universe.collect_filings()
+#         # Ensure metadata is available
+#         logger.info("Ensuring filings metadata is available...")
+#         universe.collect_filings()
 
-        # Get the filings metadata DataFrame (required input for processing functions)
-        filings_lf = universe.get_filings_lazy()
-        if filings_lf is None:
-            logger.error("Failed to get filings metadata LazyFrame. Cannot proceed.")
-        else:
-            logger.info("Collecting filings metadata...")
-            # Select columns needed by both direct and structured methods
-            required_cols = ["ticker", "xbrl_instance_url", "filingDate", "reportDate"]
-            if not all(col in filings_lf.columns for col in required_cols):
-                logger.error(
-                    f"Filings metadata missing required columns. Need: {required_cols}, Have: {filings_lf.columns}"
-                )
-            else:
-                filings_df = filings_lf.select(required_cols).collect()
+#         # Get the filings metadata DataFrame (required input for processing functions)
+#         filings_lf = universe.get_filings_lazy()
+#         if filings_lf is None:
+#             logger.error("Failed to get filings metadata LazyFrame. Cannot proceed.")
+#         else:
+#             logger.info("Collecting filings metadata...")
+#             # Select columns needed by both direct and structured methods
+#             required_cols = ["ticker", "xbrl_instance_url", "filingDate", "reportDate"]
+#             if not all(col in filings_lf.columns for col in required_cols):
+#                 logger.error(
+#                     f"Filings metadata missing required columns. Need: {required_cols}, Have: {filings_lf.columns}"
+#                 )
+#             else:
+#                 filings_df = filings_lf.select(required_cols).collect()
 
-                if filings_df.is_empty():
-                    logger.warning(
-                        "No filings metadata found for the universe. No facts to process."
-                    )
-                else:
-                    # --- Choose which processing method to run ---
-                    PROCESS_METHOD = "direct"  # or "structured"
+#                 if filings_df.is_empty():
+#                     logger.warning(
+#                         "No filings metadata found for the universe. No facts to process."
+#                     )
+#                 else:
+#                     # --- Choose which processing method to run ---
+#                     PROCESS_METHOD = "direct"  # or "structured"
 
-                    logger.info(
-                        f"Processing {len(filings_df)} filings using '{PROCESS_METHOD}' method..."
-                    )
+#                     logger.info(
+#                         f"Processing {len(filings_df)} filings using '{PROCESS_METHOD}' method..."
+#                     )
 
-                    if PROCESS_METHOD == "direct":
-                        numeric_df, text_df = process_filings_structured(filings_df)
-                        # Define output paths for direct facts
-                        numeric_path = (
-                            settings.output_dir
-                            / f"{universe.name}_numeric_facts_direct.delta"
-                        )
-                        text_path = (
-                            settings.output_dir
-                            / f"{universe.name}_text_facts_direct.delta"
-                        )
-                    else:  # structured
-                        numeric_df, text_df = process_filings_structured(filings_df)
-                        # Define output paths for structured facts
-                        numeric_path = (
-                            settings.output_dir
-                            / f"{universe.name}_numeric_facts_structured.delta"
-                        )
-                        text_path = (
-                            settings.output_dir
-                            / f"{universe.name}_text_facts_structured.delta"
-                        )
+#                     if PROCESS_METHOD == "direct":
+#                         edgar_fetcher = EDGARFetcher()
+#                         numeric_df, text_df = process_filings_structured_direct(
+#                             filings_df, edgar_fetcher
+#                         )
+#                         # Define output paths for direct facts
+#                         numeric_path = (
+#                             settings.output_dir
+#                             / f"{universe.name}_numeric_facts_direct.delta"
+#                         )
+#                         text_path = (
+#                             settings.output_dir
+#                             / f"{universe.name}_text_facts_direct.delta"
+#                         )
+#                     else:  # structured
+#                         edgar_fetcher = EDGARFetcher()
+#                         numeric_df, text_df = process_filings_structured_sections(
+#                             filings_df, edgar_fetcher
+#                         )
+#                         # Define output paths for structured facts
+#                         numeric_path = (
+#                             settings.output_dir
+#                             / f"{universe.name}_numeric_facts_structured.delta"
+#                         )
+#                         text_path = (
+#                             settings.output_dir
+#                             / f"{universe.name}_text_facts_structured.delta"
+#                         )
 
-                    logger.info(
-                        f"Saving numeric facts ({len(numeric_df)} rows) to {numeric_path}..."
-                    )
-                    numeric_df.write_delta(str(numeric_path), mode="overwrite")
+#                     logger.info(
+#                         f"Saving numeric facts ({len(numeric_df)} rows) to {numeric_path}..."
+#                     )
+#                     numeric_df.write_delta(str(numeric_path), mode="overwrite")
 
-                    logger.info(
-                        f"Saving text facts ({len(text_df)} rows) to {text_path}..."
-                    )
-                    text_df.write_delta(str(text_path), mode="overwrite")
+#                     logger.info(
+#                         f"Saving text facts ({len(text_df)} rows) to {text_path}..."
+#                     )
+#                     text_df.write_delta(str(text_path), mode="overwrite")
 
-                    logger.info("Processing and saving complete.")
+#                     logger.info("Processing and saving complete.")
 
-    except FileNotFoundError as e:
-        logger.error(f"Universe definition not found: {e}")
-    except Exception as e:
-        logger.error(
-            f"An error occurred in the main execution block: {e}", exc_info=True
-        )
+#     except FileNotFoundError as e:
+#         logger.error(f"Universe definition not found: {e}")
+#     except Exception as e:
+#         logger.error(
+#             f"An error occurred in the main execution block: {e}", exc_info=True
+#         )
 
 # --- Direct Fact Row Conversion Helpers (No Section Title) ---
 
@@ -1785,7 +1803,10 @@ def _direct_fact_to_row(fact: AbstractFact) -> Dict[str, Any]:
     row_base = {}
     # Basic Info
     row_base["concept_name"] = fact.concept.name
-    row_base["concept_namespace"] = fact.concept.schema_url.split("/")[-2]
+    if fact.concept.schema_url:
+        row_base["concept_namespace"] = fact.concept.schema_url.split("/")[-2]
+    else:
+        row_base["concept_namespace"] = None
     row_base["fact_type"] = type(fact).__name__
 
     context = getattr(fact, "context", None)
@@ -1801,9 +1822,6 @@ def _direct_fact_to_row(fact: AbstractFact) -> Dict[str, Any]:
 
         if isinstance(context, InstantContext):
             period_instant = getattr(context, "instant_date", None)
-            logger.info(
-                f"[_direct_fact_to_row] Fact {fact.concept.name}: Found InstantContext - Instant: {period_instant} (Type: {type(period_instant)})"
-            )
         elif isinstance(context, TimeFrameContext):
             period_start = getattr(context, "start_date", None)
             period_end = getattr(context, "end_date", None)
